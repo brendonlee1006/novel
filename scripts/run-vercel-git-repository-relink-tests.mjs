@@ -1,9 +1,11 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import {
-  repointVercelGitRepository,
+  repointVercelGitRepository as repointVercelGitRepositoryWithPinnedAnchor,
   safeVercelGitRelinkFailure,
   vercelGitRelinkConfigurationFromEnvironment,
+  VERCEL_GIT_RELINK_FORMAL_PROJECT_ID_SHA256,
   vercelGitRelinkChildEnvironment,
   VERCEL_GIT_RELINK_SAFE_ERROR_CODES,
   VERCEL_GIT_RELINK_TARGET_REPOSITORY,
@@ -16,6 +18,16 @@ const configuration = Object.freeze({
   projectId: "prj_12345678",
   scope: "team-fixture",
 });
+const fixtureProjectIdSha256 = createHash("sha256")
+  .update(configuration.projectId, "utf8")
+  .digest("hex");
+
+function repointVercelGitRepository(options) {
+  return repointVercelGitRepositoryWithPinnedAnchor({
+    ...options,
+    expectedProjectIdSha256: fixtureProjectIdSha256,
+  });
+}
 const fakePrivateKey = [
   "-----BEGIN",
   "PRIVATE KEY-----FAKE-MATERIAL-----END PRIVATE KEY-----",
@@ -177,6 +189,7 @@ function routeFetcher(projectBodies, {
 } = {}) {
   const requests = [];
   let projectIndex = 0;
+  let aliasIndex = 0;
   const fetcher = async (input, init = {}) => {
     const url = new URL(input);
     requests.push({
@@ -191,7 +204,10 @@ function routeFetcher(projectBodies, {
     }
     if (url.pathname.startsWith("/v2/teams/")) return jsonResponse(teamBody);
     if (url.pathname === "/v13/deployments/novel-orcin.vercel.app") {
-      return jsonResponse(aliasBody, aliasStatus);
+      const aliasBodies = Array.isArray(aliasBody) ? aliasBody : [aliasBody];
+      const body = aliasBodies[Math.min(aliasIndex, aliasBodies.length - 1)];
+      aliasIndex += 1;
+      return jsonResponse(body, aliasStatus);
     }
     if (url.pathname === "/v1/integrations/git-namespaces") return jsonResponse(namespacesBody);
     if (url.pathname === "/v1/integrations/search-repo") {
@@ -272,8 +288,14 @@ function assertZeroUnrelatedMutations(receipt, label) {
     mode: "apply",
     configuration,
     fetcher: routed.fetcher,
-    connectRepository: async (received, destination) => {
+    connectRepository: async (received, destination, execution) => {
       equal(received, configuration, "connect receives validated configuration");
+      check(
+        Number.isSafeInteger(execution?.timeoutMs)
+          && execution.timeoutMs >= 1_000
+          && execution.timeoutMs <= 60_000,
+        "target CLI timeout is bounded inside the remaining operation deadline",
+      );
       destinations.push(destination);
       return { ok: true, stdout: configuration.token, stderr: fakePrivateKey };
     },
@@ -292,6 +314,7 @@ function assertZeroUnrelatedMutations(receipt, label) {
   equal(result.formalAliasReadable, true, "formal alias is readable");
   equal(result.formalAliasProjectMatches, true, "formal alias is bound to the pinned project");
   equal(result.formalAliasProductionReady, true, "formal alias is READY production");
+  equal(result.formalProjectIdAnchorMatches, true, "formal project id matches the committed SHA-256 anchor");
   equal(result.gitLinkMutationAttemptCount, 1, "one target mutation is attempted");
   equal(result.gitLinkMutationVerifiedCount, 1, "one target mutation is verified");
   equal(result.sourceRestoreMutationAttemptCount, 0, "successful relink needs no source restore");
@@ -299,7 +322,7 @@ function assertZeroUnrelatedMutations(receipt, label) {
   deepEqual(destinations, ["target"], "apply connects only the pinned target");
   check(routed.requests.every(({ method }) => method === "GET"), "all HTTP pre/postflight calls are GET");
   equal(routed.requests.filter(({ pathname }) => pathname === "/v1/integrations/search-repo").length, 2, "Vercel visibility is checked for source and target");
-  equal(routed.requests.filter(({ pathname }) => pathname === "/v13/deployments/novel-orcin.vercel.app").length, 1, "formal alias is checked once before mutation");
+  equal(routed.requests.filter(({ pathname }) => pathname === "/v13/deployments/novel-orcin.vercel.app").length, 2, "formal alias is checked before mutation and after target linkage verification");
   assertZeroUnrelatedMutations(result, "successful relink");
   assertNoSensitiveData(result, "successful relink receipt");
 }
@@ -330,6 +353,64 @@ function assertZeroUnrelatedMutations(receipt, label) {
   });
   equal(result.outcome, "ALREADY_LINKED", "already-linked project is idempotent");
   equal(connectCount, 0, "already-linked project is not mutated");
+}
+
+{
+  const baseTime = Date.now();
+  let nowCallCount = 0;
+  const routed = routeFetcher([sourceProject()]);
+  let connectCount = 0;
+  const failure = await captureFailure(() => repointVercelGitRepository({
+    mode: "apply",
+    configuration,
+    fetcher: routed.fetcher,
+    connectRepository: async () => { connectCount += 1; return { ok: true }; },
+    now: () => {
+      nowCallCount += 1;
+      return nowCallCount === 1 ? baseTime : baseTime + 110_000;
+    },
+  }));
+  equal(failure.errorCode, "VERCEL_GIT_RELINK_MUTATION_BUDGET_EXHAUSTED", "insufficient target and full post-mutation verification budget fails before mutation");
+  equal(failure.gitLinkMutationAttemptCount, 0, "target mutation is not started without reserved recovery time");
+  equal(connectCount, 0, "deadline guard prevents the target CLI from starting");
+  equal(failure.manualRecoveryRequired, false, "source remains verified when target mutation never starts");
+  assertNoSensitiveData(failure, "pre-target deadline guard receipt");
+}
+
+{
+  const routed = routeFetcher(
+    [sourceProject(), targetProject()],
+    {
+      aliasBody: [
+        formalAlias(),
+        formalAlias({ projectId: "prj_wrong_project" }),
+      ],
+    },
+  );
+  const destinations = [];
+  const failure = await captureFailure(() => repointVercelGitRepository({
+    mode: "apply",
+    configuration,
+    fetcher: routed.fetcher,
+    connectRepository: async (_received, destination) => {
+      destinations.push(destination);
+      return { ok: true };
+    },
+    retryDelay: async () => undefined,
+  }));
+  equal(failure.errorCode, "VERCEL_GIT_RELINK_FORMAL_ALIAS_PROJECT_MISMATCH", "formal alias drift after target linkage fails closed");
+  equal(failure.finalLinkState, "expected-target", "alias drift preserves the verified target-link observation");
+  equal(failure.gitLinkMutationVerifiedCount, 1, "target linkage remains truthfully recorded before alias revalidation fails");
+  equal(failure.formalAliasProjectMatches, false, "post-link alias project drift is reported safely");
+  equal(failure.sourceRestoreMutationAttemptCount, 0, "alias drift alone never compensates Git linkage");
+  equal(failure.manualRecoveryRequired, false, "alias drift uses its specific fail-closed error without initiating recovery");
+  deepEqual(destinations, ["target"], "alias drift cannot issue a second linkage mutation");
+  equal(
+    routed.requests.filter(({ pathname }) => pathname === "/v13/deployments/novel-orcin.vercel.app").length,
+    2,
+    "alias drift test compares independent before and after reads",
+  );
+  assertNoSensitiveData(failure, "post-link alias drift receipt");
 }
 
 for (const test of [
@@ -452,12 +533,14 @@ for (const test of [
 {
   const routed = routeFetcher([sourceProject(), unlinkedProject(), sourceProject()]);
   const destinations = [];
+  const mutationTimeouts = [];
   const failure = await captureFailure(() => repointVercelGitRepository({
     mode: "apply",
     configuration,
     fetcher: routed.fetcher,
-    connectRepository: async (_received, destination) => {
+    connectRepository: async (_received, destination, execution) => {
       destinations.push(destination);
+      mutationTimeouts.push({ destination, timeoutMs: execution.timeoutMs });
       if (destination === "target") {
         return {
           ok: false,
@@ -472,32 +555,50 @@ for (const test of [
     postconditionAttempts: 1,
     retryDelay: async () => undefined,
   }));
-  equal(failure.errorCode, "VERCEL_GIT_RELINK_TARGET_CONNECT_FAILED_COMPENSATED", "disconnect then target failure is compensated");
+  equal(failure.errorCode, "VERCEL_GIT_RELINK_MANUAL_RECOVERY_REQUIRED", "disconnect plus an ambiguous target failure requires a later recovery run");
   equal(failure.postCommandFailureCheckCompleted, true, "target command failure gets a read-only postflight");
   equal(failure.postCommandFailureState, "known-unlinked", "postflight identifies the disconnected state");
-  equal(failure.finalLinkState, "expected-source", "compensation restores source linkage");
+  equal(failure.finalLinkState, "unlinked", "the same run preserves the observed unlinked state");
   equal(failure.gitLinkMutationAttemptCount, 1, "target attempt is recorded once");
   equal(failure.gitLinkMutationVerifiedCount, 0, "target attempt is not claimed verified");
-  equal(failure.sourceRestoreMutationAttemptCount, 1, "compensation is attempted once");
-  equal(failure.sourceRestoreMutationVerifiedCount, 1, "compensation is verified once");
-  equal(failure.compensationState, "restored-source", "compensation state is explicit");
-  deepEqual(destinations, ["target", "source"], "compensation uses only pinned target then source");
-  assertZeroUnrelatedMutations(failure, "compensated target failure");
-  assertNoSensitiveData(failure, "compensated target failure receipt");
+  equal(failure.sourceRestoreMutationAttemptCount, 0, "an ambiguous target failure never starts same-run source recovery");
+  equal(failure.sourceRestoreMutationVerifiedCount, 0, "same-run source recovery is never claimed verified");
+  equal(failure.compensationState, "not-required", "no automatic compensation is claimed");
+  equal(failure.manualRecoveryRequired, true, "a separate reviewed restore-source run is required");
+  deepEqual(destinations, ["target"], "an ambiguous target failure cannot issue a second linkage mutation");
+  check(mutationTimeouts[0].timeoutMs <= 60_000, "target mutation is capped at sixty seconds");
+  assertZeroUnrelatedMutations(failure, "ambiguous target failure");
+  assertNoSensitiveData(failure, "ambiguous target failure receipt");
 }
 
 {
-  const routed = routeFetcher([sourceProject(), unlinkedProject(), unlinkedProject()]);
+  const routed = routeFetcher([sourceProject()]);
+  let projectReadCount = 0;
+  let simulatedLink = sourceProject();
+  const fetcher = async (input, init = {}) => {
+    const url = new URL(input);
+    if (url.pathname.startsWith("/v9/projects/")) {
+      projectReadCount += 1;
+      return jsonResponse(projectReadCount === 1 ? sourceProject() : simulatedLink);
+    }
+    return routed.fetcher(input, init);
+  };
   const destinations = [];
+  let sourceMutationAttempted = false;
   const failure = await captureFailure(() => repointVercelGitRepository({
     mode: "apply",
     configuration,
-    fetcher: routed.fetcher,
+    fetcher,
     connectRepository: async (_received, destination) => {
       destinations.push(destination);
+      if (destination === "source") sourceMutationAttempted = true;
+      if (destination === "target") {
+        simulatedLink = unlinkedProject();
+        setTimeout(() => { simulatedLink = targetProject(); }, 10);
+      }
       return {
         ok: false,
-        errorCode: "VERCEL_GIT_RELINK_COMMAND_FAILED",
+        errorCode: "VERCEL_GIT_RELINK_COMMAND_TIMEOUT",
         stdout: fakeAuthorization,
         stderr: `${fakePrivateKey}${fakeSupabaseKey}`,
       };
@@ -505,13 +606,15 @@ for (const test of [
     postconditionAttempts: 1,
     retryDelay: async () => undefined,
   }));
-  equal(failure.errorCode, "VERCEL_GIT_RELINK_COMPENSATION_FAILED", "failed source compensation has a distinct safe error");
-  equal(failure.finalLinkState, "unlinked", "failed compensation reports observed unlinked state");
-  equal(failure.sourceRestoreMutationAttemptCount, 1, "failed compensation is attempted once");
-  equal(failure.sourceRestoreMutationVerifiedCount, 0, "failed compensation is never claimed verified");
-  equal(failure.compensationState, "failed", "failed compensation is explicit");
-  deepEqual(destinations, ["target", "source"], "failed compensation uses only pinned destinations");
-  assertNoSensitiveData(failure, "failed compensation receipt");
+  await new Promise((resolve) => setTimeout(resolve, 25));
+  equal(failure.errorCode, "VERCEL_GIT_RELINK_MANUAL_RECOVERY_REQUIRED", "timed-out target connect requires manual recovery even when GET reads unlinked");
+  equal(failure.finalLinkState, "unlinked", "delayed-target race retains the latest conclusive read");
+  deepEqual(simulatedLink, targetProject(), "the simulated target request lands only after the failed run returns");
+  equal(sourceMutationAttempted, false, "same-run source mutation cannot race delayed target completion");
+  equal(failure.sourceRestoreMutationAttemptCount, 0, "delayed-target race never starts automatic compensation");
+  equal(failure.manualRecoveryRequired, true, "delayed-target race requires a later fresh-state restore run");
+  deepEqual(destinations, ["target"], "delayed-target race issues only the target mutation");
+  assertNoSensitiveData(failure, "delayed-target race receipt");
 }
 
 {
@@ -528,13 +631,14 @@ for (const test of [
     postconditionAttempts: 1,
     retryDelay: async () => undefined,
   }));
-  equal(failure.errorCode, "VERCEL_GIT_RELINK_TARGET_POSTCONDITION_FAILED_COMPENSATED", "exit zero but unlinked postflight is compensated");
-  equal(failure.finalLinkState, "expected-source", "postcondition compensation restores source");
-  equal(failure.compensationState, "restored-source", "postcondition compensation is explicit");
-  equal(failure.sourceRestoreMutationAttemptCount, 1, "postcondition compensation attempts source once");
-  equal(failure.sourceRestoreMutationVerifiedCount, 1, "postcondition compensation verifies source once");
-  deepEqual(destinations, ["target", "source"], "postcondition compensation uses pinned destinations");
-  assertNoSensitiveData(failure, "postcondition compensation receipt");
+  equal(failure.errorCode, "VERCEL_GIT_RELINK_MANUAL_RECOVERY_REQUIRED", "exit zero plus an unlinked postflight requires manual recovery");
+  equal(failure.finalLinkState, "unlinked", "ambiguous postcondition preserves the observed unlinked state");
+  equal(failure.compensationState, "not-required", "ambiguous postcondition does not claim compensation");
+  equal(failure.sourceRestoreMutationAttemptCount, 0, "ambiguous postcondition never reconnects source in the same run");
+  equal(failure.sourceRestoreMutationVerifiedCount, 0, "no same-run restore is claimed verified");
+  equal(failure.manualRecoveryRequired, true, "ambiguous postcondition requires a later recovery run");
+  deepEqual(destinations, ["target"], "ambiguous postcondition issues no second mutation");
+  assertNoSensitiveData(failure, "ambiguous postcondition receipt");
 }
 
 {
@@ -550,11 +654,12 @@ for (const test of [
       stderr: `${fakePrivateKey}${fakeSupabaseKey}`,
     }),
   }));
-  equal(failure.errorCode, "VERCEL_GIT_RELINK_COMMAND_FAILED", "nonzero command remains failure even when target linked");
+  equal(failure.errorCode, "VERCEL_GIT_RELINK_MANUAL_RECOVERY_REQUIRED", "nonzero command requires manual reconciliation even when target is observed");
   equal(failure.postCommandFailureState, "known-new", "postflight safely reports known target");
   equal(failure.finalLinkState, "expected-target", "target identity is verified after nonzero exit");
   equal(failure.gitLinkMutationVerifiedCount, 1, "known target is recorded as verified");
   equal(failure.sourceRestoreMutationAttemptCount, 0, "verified target is never rolled back");
+  equal(failure.manualRecoveryRequired, true, "ambiguous command result remains explicit");
   assertNoSensitiveData(failure, "known target command failure receipt");
 }
 
@@ -572,14 +677,199 @@ for (const test of [
     postconditionAttempts: 1,
     retryDelay: async () => undefined,
   }));
-  equal(failure.errorCode, "VERCEL_GIT_RELINK_POSTCONDITION_FAILED", "known source postcondition fails without redundant compensation");
+  equal(failure.errorCode, "VERCEL_GIT_RELINK_MANUAL_RECOVERY_REQUIRED", "known source postcondition still requires later reconciliation");
   equal(failure.finalLinkState, "expected-source", "known source state remains explicit");
   equal(failure.sourceRestoreMutationAttemptCount, 0, "known source needs no compensating mutation");
+  equal(failure.manualRecoveryRequired, true, "a target command with mismatched postcondition remains ambiguous");
   deepEqual(destinations, ["target"], "known source postcondition does not reconnect source");
 }
 
 {
   let projectReadCount = 0;
+  const routed = routeFetcher([sourceProject(), unlinkedProject(), sourceProject()]);
+  const fetcher = async (input, init = {}) => {
+    const url = new URL(input);
+    if (url.pathname.startsWith("/v9/projects/")) {
+      projectReadCount += 1;
+      if (projectReadCount === 2) {
+        return jsonResponse({ detail: configuration.token }, 503);
+      }
+    }
+    return routed.fetcher(input, init);
+  };
+  const destinations = [];
+  const failure = await captureFailure(() => repointVercelGitRepository({
+    mode: "apply",
+    configuration,
+    fetcher,
+    connectRepository: async (_received, destination) => {
+      destinations.push(destination);
+      return destination === "target"
+        ? { ok: false, errorCode: "VERCEL_GIT_RELINK_COMMAND_FAILED" }
+        : { ok: true };
+    },
+    postconditionAttempts: 2,
+    retryDelay: async () => undefined,
+  }));
+  equal(failure.errorCode, "VERCEL_GIT_RELINK_MANUAL_RECOVERY_REQUIRED", "transient postflight then unlinked requires a later recovery run");
+  equal(failure.finalLinkState, "unlinked", "transient postflight preserves the conclusive unlinked observation");
+  equal(failure.sourceRestoreMutationVerifiedCount, 0, "transient postflight never claims same-run recovery");
+  equal(failure.sourceRestoreMutationAttemptCount, 0, "transient postflight never starts same-run recovery");
+  deepEqual(destinations, ["target"], "transient postflight cannot issue a racing source mutation");
+  assertNoSensitiveData(failure, "transient postflight manual-recovery receipt");
+}
+
+{
+  const baseTime = Date.now();
+  let nowCallCount = 0;
+  const routed = routeFetcher([sourceProject(), unlinkedProject()]);
+  const destinations = [];
+  const failure = await captureFailure(() => repointVercelGitRepository({
+    mode: "apply",
+    configuration,
+    fetcher: routed.fetcher,
+    connectRepository: async (_received, destination, execution) => {
+      destinations.push(destination);
+      check(execution.timeoutMs <= 60_000, "late-deadline target mutation remains bounded");
+      return { ok: false, errorCode: "VERCEL_GIT_RELINK_COMMAND_FAILED" };
+    },
+    postconditionAttempts: 1,
+    retryDelay: async () => undefined,
+    now: () => {
+      nowCallCount += 1;
+      return nowCallCount <= 2 ? baseTime : baseTime + 175_000;
+    },
+  }));
+  equal(failure.errorCode, "VERCEL_GIT_RELINK_MANUAL_RECOVERY_REQUIRED", "insufficient recovery budget stops with an explicit manual-recovery result");
+  equal(failure.finalLinkState, "unlinked", "late-deadline recovery preserves the conclusive unlinked observation");
+  equal(failure.sourceRestoreMutationAttemptCount, 0, "deadline exhaustion prevents a second linkage mutation");
+  equal(failure.manualRecoveryRequired, true, "deadline exhaustion explicitly requests manual recovery");
+  deepEqual(destinations, ["target"], "late deadline cannot start source compensation");
+  assertNoSensitiveData(failure, "late-deadline recovery receipt");
+}
+
+{
+  let projectReadCount = 0;
+  const routed = routeFetcher([sourceProject(), sourceProject()]);
+  const fetcher = async (input, init = {}) => {
+    const url = new URL(input);
+    if (url.pathname.startsWith("/v9/projects/")) {
+      projectReadCount += 1;
+      if (projectReadCount >= 2 && projectReadCount <= 4) {
+        return jsonResponse({ authorization: fakeAuthorization }, 503);
+      }
+    }
+    return routed.fetcher(input, init);
+  };
+  const destinations = [];
+  const failure = await captureFailure(() => repointVercelGitRepository({
+    mode: "apply",
+    configuration,
+    fetcher,
+    connectRepository: async (_received, destination) => {
+      destinations.push(destination);
+      return { ok: true };
+    },
+    retryDelay: async () => undefined,
+  }));
+  equal(failure.errorCode, "VERCEL_GIT_RELINK_MANUAL_RECOVERY_REQUIRED", "an unobservable successful command stops for manual read-only reconciliation");
+  equal(failure.finalLinkState, "unchecked", "an unobservable target outcome is never guessed");
+  equal(failure.sourceRestoreMutationAttemptCount, 0, "an unobservable target outcome is never auto-compensated without a fence");
+  equal(failure.compensationState, "not-required", "an unfenced target outcome does not claim compensation");
+  equal(failure.manualRecoveryRequired, true, "an unobservable successful command explicitly requires manual recovery");
+  deepEqual(destinations, ["target"], "an unfenced target outcome cannot race a delayed connect with source recovery");
+  assertNoSensitiveData(failure, "unobservable target outcome receipt");
+}
+
+{
+  const mismatchedProject = targetProject();
+  mismatchedProject.id = "prj_other_project";
+  const routed = routeFetcher([sourceProject(), mismatchedProject]);
+  const destinations = [];
+  const failure = await captureFailure(() => repointVercelGitRepository({
+    mode: "apply",
+    configuration,
+    fetcher: routed.fetcher,
+    connectRepository: async (_received, destination) => {
+      destinations.push(destination);
+      return { ok: true };
+    },
+    retryDelay: async () => undefined,
+  }));
+  equal(failure.errorCode, "VERCEL_GIT_RELINK_PROJECT_IDENTITY_MISMATCH", "postflight project identity mismatch is not treated as a transient read failure");
+  equal(failure.sourceRestoreMutationAttemptCount, 0, "identity mismatch never authorizes a compensating mutation");
+  deepEqual(destinations, ["target"], "identity mismatch does not mutate an unverified project a second time");
+  assertNoSensitiveData(failure, "postflight identity mismatch receipt");
+}
+
+{
+  let projectReadCount = 0;
+  const routed = routeFetcher([sourceProject(), unexpectedProject()]);
+  const fetcher = async (input, init = {}) => {
+    const url = new URL(input);
+    if (url.pathname.startsWith("/v9/projects/")) {
+      projectReadCount += 1;
+      if (projectReadCount >= 3) {
+        return jsonResponse({ detail: configuration.token }, 503);
+      }
+    }
+    return routed.fetcher(input, init);
+  };
+  const destinations = [];
+  const failure = await captureFailure(() => repointVercelGitRepository({
+    mode: "apply",
+    configuration,
+    fetcher,
+    connectRepository: async (_received, destination) => {
+      destinations.push(destination);
+      return { ok: false, errorCode: "VERCEL_GIT_RELINK_COMMAND_FAILED" };
+    },
+    retryDelay: async () => undefined,
+  }));
+  equal(failure.errorCode, "VERCEL_GIT_RELINK_MANUAL_RECOVERY_REQUIRED", "unexpected then transient postflight failures require manual reconciliation");
+  equal(failure.finalLinkState, "unexpected", "later transient failures cannot erase a readable unexpected state");
+  equal(failure.postCommandFailureCheckCompleted, true, "the successful unexpected observation remains recorded");
+  equal(failure.sourceRestoreMutationAttemptCount, 0, "an unexpected state never authorizes automatic compensation");
+  equal(projectReadCount, 4, "unexpected then 503 then 503 exercises all bounded observations");
+  deepEqual(destinations, ["target"], "unexpected state prevents a second linkage mutation");
+  assertNoSensitiveData(failure, "unexpected then transient postflight receipt");
+}
+
+{
+  let projectReadCount = 0;
+  const routed = routeFetcher([sourceProject(), unlinkedProject()]);
+  const fetcher = async (input, init = {}) => {
+    const url = new URL(input);
+    if (url.pathname.startsWith("/v9/projects/")) {
+      projectReadCount += 1;
+      if (projectReadCount >= 3) {
+        return jsonResponse({ detail: configuration.token }, 503);
+      }
+    }
+    return routed.fetcher(input, init);
+  };
+  const destinations = [];
+  const failure = await captureFailure(() => repointVercelGitRepository({
+    mode: "apply",
+    configuration,
+    fetcher,
+    connectRepository: async (_received, destination) => {
+      destinations.push(destination);
+      return { ok: false, errorCode: "VERCEL_GIT_RELINK_COMMAND_FAILED" };
+    },
+    retryDelay: async () => undefined,
+  }));
+  equal(failure.errorCode, "VERCEL_GIT_RELINK_MANUAL_RECOVERY_REQUIRED", "unlinked then transient failures are not treated as a conclusive recovery fence");
+  equal(failure.finalLinkState, "unchecked", "stale unlinked observation followed by failures is reported as unobservable");
+  equal(failure.sourceRestoreMutationAttemptCount, 0, "stale unlinked observation cannot start source compensation");
+  equal(projectReadCount, 4, "unlinked then 503 then 503 exercises all bounded observations");
+  deepEqual(destinations, ["target"], "stale unlinked observation cannot race a delayed target connect");
+  assertNoSensitiveData(failure, "unlinked then transient postflight receipt");
+}
+
+{
+  let projectReadCount = 0;
+  const destinations = [];
   const routed = routeFetcher([sourceProject()]);
   const fetcher = async (input, init = {}) => {
     const url = new URL(input);
@@ -595,17 +885,24 @@ for (const test of [
     mode: "apply",
     configuration,
     fetcher,
-    connectRepository: async () => ({
-      ok: false,
-      stdout: fakeAuthorization,
-      stderr: `${fakePrivateKey}${fakeSupabaseKey}`,
-    }),
+    connectRepository: async (_received, destination) => {
+      destinations.push(destination);
+      return {
+        ok: false,
+        stdout: fakeAuthorization,
+        stderr: `${fakePrivateKey}${fakeSupabaseKey}`,
+      };
+    },
   }));
-  equal(failure.errorCode, "VERCEL_GIT_RELINK_COMMAND_FAILED", "command failure remains safely classified when postflight is unavailable");
+  equal(failure.errorCode, "VERCEL_GIT_RELINK_MANUAL_RECOVERY_REQUIRED", "an unavailable postflight stops with an explicit manual-recovery result");
   equal(failure.postCommandFailureCheckCompleted, false, "unavailable postflight is not claimed complete");
   equal(failure.postCommandFailureState, "unknown", "unavailable postflight reports unknown state");
   equal(failure.finalLinkState, "unchecked", "unavailable postflight does not guess linkage");
-  equal(failure.sourceRestoreMutationAttemptCount, 0, "unknown state is never mutated by guesswork");
+  equal(failure.sourceRestoreMutationAttemptCount, 0, "unknown target outcome is never auto-compensated without a fence");
+  equal(failure.sourceRestoreMutationVerifiedCount, 0, "unavailable recovery postflight is never claimed verified");
+  equal(failure.compensationState, "not-required", "unobservable target outcome does not claim a recovery attempt");
+  equal(failure.manualRecoveryRequired, true, "unobservable target failure explicitly requires manual recovery");
+  deepEqual(destinations, ["target"], "unknown target outcome cannot race a delayed connect with source recovery");
   assertNoSensitiveData(failure, "unavailable postflight receipt");
 }
 
@@ -635,6 +932,28 @@ for (const test of [
   deepEqual(destinations, ["source"], "explicit restore can only connect pinned source");
   assertZeroUnrelatedMutations(result, "explicit source restore");
   assertNoSensitiveData(result, "explicit source restore receipt");
+}
+
+{
+  const baseTime = Date.now();
+  let nowCallCount = 0;
+  let connectCount = 0;
+  const routed = routeFetcher([unlinkedProject()]);
+  const failure = await captureFailure(() => repointVercelGitRepository({
+    mode: "restore-source",
+    configuration,
+    fetcher: routed.fetcher,
+    connectRepository: async () => { connectCount += 1; return { ok: true }; },
+    now: () => {
+      nowCallCount += 1;
+      return nowCallCount === 1 ? baseTime : baseTime + 100_000;
+    },
+  }));
+  equal(failure.errorCode, "VERCEL_GIT_RELINK_MANUAL_RECOVERY_REQUIRED", "explicit restore refuses to mutate without the full verification reserve");
+  equal(connectCount, 0, "insufficient verification time prevents the source mutation");
+  equal(failure.sourceRestoreMutationAttemptCount, 0, "unstarted source mutation is recorded accurately");
+  equal(failure.manualRecoveryRequired, true, "insufficient restore budget remains explicitly recoverable in a later run");
+  assertNoSensitiveData(failure, "source verification budget receipt");
 }
 
 for (const initialProject of [targetProject(), sourceProject(), unexpectedProject()]) {
@@ -680,7 +999,7 @@ for (const initialProject of [targetProject(), sourceProject(), unexpectedProjec
     VERCEL_ORG_ID: configuration.teamId,
     VERCEL_PROJECT_ID: configuration.projectId,
     VERCEL_SCOPE: configuration.scope,
-  });
+  }, fixtureProjectIdSha256);
   equal(parsed.projectId, configuration.projectId, "valid environment configuration parses");
   const failure = await captureFailure(async () => {
     vercelGitRelinkConfigurationFromEnvironment({
@@ -688,21 +1007,50 @@ for (const initialProject of [targetProject(), sourceProject(), unexpectedProjec
       VERCEL_ORG_ID: configuration.teamId,
       VERCEL_PROJECT_ID: configuration.projectId,
       VERCEL_SCOPE: configuration.scope,
-    });
+    }, fixtureProjectIdSha256);
   });
   equal(failure.errorCode, "VERCEL_GIT_RELINK_CONFIGURATION_INVALID", "missing token is a safe configuration failure");
   assertNoSensitiveData(failure, "configuration failure receipt");
 }
 
 {
+  let fetchCount = 0;
+  let connectCount = 0;
+  const failure = await captureFailure(() => repointVercelGitRepositoryWithPinnedAnchor({
+    mode: "apply",
+    configuration,
+    fetcher: async () => { fetchCount += 1; return jsonResponse({}); },
+    connectRepository: async () => { connectCount += 1; return { ok: true }; },
+  }));
+  equal(
+    failure.errorCode,
+    "VERCEL_GIT_RELINK_FORMAL_PROJECT_ID_ANCHOR_MISMATCH",
+    "a project id that does not match the committed formal-project anchor fails closed",
+  );
+  equal(fetchCount, 0, "formal-project anchor mismatch fails before any API read");
+  equal(connectCount, 0, "formal-project anchor mismatch fails before any mutation");
+  assertNoSensitiveData(failure, "formal-project anchor mismatch receipt");
+}
+
+{
   const source = await readFile(new URL("./repoint-vercel-git-repository.mjs", import.meta.url), "utf8");
   check(source.includes("node_modules"), "real command resolves repository-local Vercel CLI");
   check(source.includes("VERCEL_CLI_ENTRY_PATH"), "real command uses absolute Vercel CLI entry point");
+  check(source.includes("createHash(\"sha256\")"), "formal project identity is validated with SHA-256");
+  check(
+    source.includes(VERCEL_GIT_RELINK_FORMAL_PROJECT_ID_SHA256),
+    "the formal project id hash is committed as an immutable anchor",
+  );
   check(source.includes('"git",\n      "connect"'), "real command is limited to Vercel git connect");
   check(source.includes("VERCEL_GIT_RELINK_SOURCE_URL"), "recovery pins source URL");
   check(source.includes('destination === "target"'), "destination uses a closed target branch");
   check(source.includes('destination === "source"'), "destination uses a closed source branch");
   check(source.includes('stdio: "ignore"'), "real command discards all child output");
+  check(source.includes("timeout: timeoutMs"), "real CLI mutation uses the reserved remaining-deadline timeout");
+  check(source.includes("PROJECT_POSTCONDITION_WORST_CASE_MS"), "mutation reserve covers every bounded project fetch and JSON parse attempt");
+  check(source.includes("TARGET_POST_MUTATION_VERIFICATION_RESERVE_MS"), "target mutation reserves both project and formal-alias verification time");
+  check(!source.includes("compensateSourceOrFail"), "apply mode cannot perform same-run source compensation");
+  check(!source.includes("OPERATION_TIMEOUT_MS"), "real CLI mutation cannot use the former fixed 120-second timeout");
   check(source.includes("env: vercelGitRelinkChildEnvironment(configuration)"), "spawn uses tested env allowlist");
   check(!source.includes("...process.env"), "spawn never forwards complete job environment");
   check(!source.includes('"--token",\n      configuration.token'), "token is absent from child arguments");
@@ -714,6 +1062,9 @@ for (const initialProject of [targetProject(), sourceProject(), unexpectedProjec
   check(source.includes('"--restore-source"'), "CLI exposes explicit source recovery");
   equal(VERCEL_GIT_RELINK_TARGET_URL, "https://github.com/brendonlee1006/novel.git", "target URL is not dynamic");
   for (const code of [
+    "VERCEL_GIT_RELINK_FORMAL_PROJECT_ID_ANCHOR_MISMATCH",
+    "VERCEL_GIT_RELINK_MUTATION_BUDGET_EXHAUSTED",
+    "VERCEL_GIT_RELINK_MANUAL_RECOVERY_REQUIRED",
     "VERCEL_GIT_RELINK_TARGET_CONNECT_FAILED_COMPENSATED",
     "VERCEL_GIT_RELINK_TARGET_POSTCONDITION_FAILED_COMPENSATED",
     "VERCEL_GIT_RELINK_COMPENSATION_FAILED",
@@ -741,6 +1092,7 @@ for (const initialProject of [targetProject(), sourceProject(), unexpectedProjec
   check(/inputs\.operation == 'repoint-to-personal-repository'/u.test(workflow), "normal relink requires the explicit operation");
   check(/inputs\.operation == 'restore-source-linkage'/u.test(workflow), "source recovery requires the explicit operation");
   check(/environment:\s*production-migration/u.test(workflow), "workflow uses protected migration environment");
+  check(!/EXPECTED.*VERCEL.*PROJECT|FORMAL.*PROJECT.*SHA/iu.test(workflow), "workflow cannot replace the committed formal-project anchor with mutable input");
   check(/permissions:\s*\r?\n  contents: read/u.test(workflow), "workflow token is read-only");
   check(/persist-credentials:\s*false/u.test(workflow), "checkout credentials are not persisted");
   check(/deploymentEnabled !== false/u.test(workflow), "native Git deployment stays disabled");

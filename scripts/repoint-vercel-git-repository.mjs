@@ -1,4 +1,5 @@
 import { spawnSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
@@ -15,6 +16,8 @@ export const VERCEL_GIT_RELINK_TARGET_URL =
 export const VERCEL_GIT_RELINK_EXPECTED_SOURCE_REPOSITORY = "bobobo-org/novel";
 export const VERCEL_GIT_RELINK_SOURCE_URL =
   "https://github.com/bobobo-org/novel.git";
+export const VERCEL_GIT_RELINK_FORMAL_PROJECT_ID_SHA256 =
+  "bad911aca988da4a63f8b0e4b4a7ecf9386590902f1282766feac4305786119f";
 
 const TARGET_GITHUB_REPOSITORY_ID = "1357493987";
 const TARGET_GITHUB_REPOSITORY_NODE_ID = "R_kgDOUOm24w";
@@ -39,13 +42,27 @@ const VERCEL_CLI_ENTRY_PATH = join(
   "index.js",
 );
 const FETCH_TIMEOUT_MS = 15_000;
-const OPERATION_TIMEOUT_MS = 120_000;
+const TARGET_CONNECT_TIMEOUT_MS = 60_000;
+const SOURCE_CONNECT_TIMEOUT_MS = 30_000;
+const MIN_MUTATION_TIMEOUT_MS = 1_000;
 const TOTAL_OPERATION_DEADLINE_MS = 180_000;
 const POSTCONDITION_ATTEMPTS = 3;
 const POSTCONDITION_RETRY_DELAY_MS = 1_000;
+const JSON_READ_WORST_CASE_MS = FETCH_TIMEOUT_MS * 2;
+const PROJECT_POSTCONDITION_WORST_CASE_MS =
+  (POSTCONDITION_ATTEMPTS * JSON_READ_WORST_CASE_MS)
+  + ((POSTCONDITION_ATTEMPTS - 1) * POSTCONDITION_RETRY_DELAY_MS);
+const DEADLINE_ACCOUNTING_MARGIN_MS = 2_000;
+const SOURCE_POST_MUTATION_VERIFICATION_RESERVE_MS =
+  PROJECT_POSTCONDITION_WORST_CASE_MS + DEADLINE_ACCOUNTING_MARGIN_MS;
+const TARGET_POST_MUTATION_VERIFICATION_RESERVE_MS =
+  PROJECT_POSTCONDITION_WORST_CASE_MS
+  + JSON_READ_WORST_CASE_MS
+  + DEADLINE_ACCOUNTING_MARGIN_MS;
 const SAFE_SCOPE = /^[a-z0-9](?:[a-z0-9-]{0,98}[a-z0-9])?$/u;
 const SAFE_TEAM_ID = /^team_[A-Za-z0-9]{8,128}$/u;
 const SAFE_PROJECT_ID = /^prj_[A-Za-z0-9]{8,128}$/u;
+const SAFE_SHA256 = /^[a-f0-9]{64}$/u;
 const SAFE_SIGNAL = /^[A-Z][A-Z0-9]{1,31}$/u;
 const CHILD_ENVIRONMENT_ALLOWLIST = Object.freeze([
   "PATH",
@@ -82,12 +99,15 @@ export const VERCEL_GIT_RELINK_SAFE_ERROR_CODES = Object.freeze([
   "VERCEL_GIT_RELINK_TIMEOUT",
   "VERCEL_GIT_RELINK_RESPONSE_INVALID",
   "VERCEL_GIT_RELINK_TEAM_IDENTITY_MISMATCH",
+  "VERCEL_GIT_RELINK_FORMAL_PROJECT_ID_ANCHOR_MISMATCH",
   "VERCEL_GIT_RELINK_PROJECT_IDENTITY_MISMATCH",
   "VERCEL_GIT_RELINK_FORMAL_ALIAS_NOT_FOUND_OR_INACCESSIBLE",
   "VERCEL_GIT_RELINK_FORMAL_ALIAS_NOT_PRODUCTION_READY",
   "VERCEL_GIT_RELINK_FORMAL_ALIAS_PROJECT_MISMATCH",
   "VERCEL_GIT_RELINK_SOURCE_NOT_EXPECTED",
   "VERCEL_GIT_RELINK_SOURCE_REPOSITORY_ID_UNAVAILABLE",
+  "VERCEL_GIT_RELINK_MUTATION_BUDGET_EXHAUSTED",
+  "VERCEL_GIT_RELINK_MANUAL_RECOVERY_REQUIRED",
   "VERCEL_GIT_RELINK_COMMAND_FAILED",
   "VERCEL_GIT_RELINK_COMMAND_TIMEOUT",
   "VERCEL_GIT_RELINK_TARGET_CONNECT_FAILED_COMPENSATED",
@@ -136,6 +156,12 @@ const SAFE_COMPENSATION_STATES = new Set([
   "failed",
   "unknown",
 ]);
+const RETRYABLE_POSTCONDITION_ERROR_CODES = new Set([
+  "VERCEL_GIT_RELINK_RATE_LIMITED",
+  "VERCEL_GIT_RELINK_SERVICE_UNAVAILABLE",
+  "VERCEL_GIT_RELINK_NETWORK_UNAVAILABLE",
+  "VERCEL_GIT_RELINK_TIMEOUT",
+]);
 
 class VercelGitRelinkError extends Error {
   constructor(code, stage, safeState = {}) {
@@ -160,7 +186,30 @@ function configurationError() {
   );
 }
 
-export function vercelGitRelinkConfigurationFromEnvironment(environment = process.env) {
+function projectIdSha256(projectId) {
+  return createHash("sha256").update(projectId, "utf8").digest("hex");
+}
+
+function assertFormalProjectIdAnchor(
+  projectId,
+  expectedProjectIdSha256 = VERCEL_GIT_RELINK_FORMAL_PROJECT_ID_SHA256,
+) {
+  const expected = normalizedString(expectedProjectIdSha256).toLowerCase();
+  if (
+    !SAFE_SHA256.test(expected)
+    || projectIdSha256(projectId) !== expected
+  ) {
+    fail(
+      "VERCEL_GIT_RELINK_FORMAL_PROJECT_ID_ANCHOR_MISMATCH",
+      "configuration",
+    );
+  }
+}
+
+export function vercelGitRelinkConfigurationFromEnvironment(
+  environment = process.env,
+  expectedProjectIdSha256 = VERCEL_GIT_RELINK_FORMAL_PROJECT_ID_SHA256,
+) {
   const token = normalizedString(environment.VERCEL_TOKEN);
   const teamId = normalizedString(environment.VERCEL_ORG_ID);
   const projectId = normalizedString(environment.VERCEL_PROJECT_ID);
@@ -172,6 +221,7 @@ export function vercelGitRelinkConfigurationFromEnvironment(environment = proces
     || !SAFE_PROJECT_ID.test(projectId)
     || !SAFE_SCOPE.test(scope)
   ) configurationError();
+  assertFormalProjectIdAnchor(projectId, expectedProjectIdSha256);
   return Object.freeze({ token, teamId, projectId, scope });
 }
 
@@ -188,6 +238,7 @@ function initialState(mode) {
     teamReadable: false,
     teamIdentityMatches: false,
     projectReadable: false,
+    formalProjectIdAnchorMatches: false,
     projectIdentityMatches: false,
     formalAliasReadable: false,
     formalAliasProjectMatches: false,
@@ -202,6 +253,7 @@ function initialState(mode) {
     sourceRestoreMutationAttemptCount: 0,
     sourceRestoreMutationVerifiedCount: 0,
     compensationState: "not-required",
+    manualRecoveryRequired: false,
     environmentMutationCount: 0,
     deploymentMutationCount: 0,
     aliasMutationCount: 0,
@@ -226,6 +278,7 @@ function sanitizeState(state = {}) {
     teamReadable: state.teamReadable === true,
     teamIdentityMatches: state.teamIdentityMatches === true,
     projectReadable: state.projectReadable === true,
+    formalProjectIdAnchorMatches: state.formalProjectIdAnchorMatches === true,
     projectIdentityMatches: state.projectIdentityMatches === true,
     formalAliasReadable: state.formalAliasReadable === true,
     formalAliasProjectMatches: state.formalAliasProjectMatches === true,
@@ -248,6 +301,7 @@ function sanitizeState(state = {}) {
     compensationState: SAFE_COMPENSATION_STATES.has(state.compensationState)
       ? state.compensationState
       : "unknown",
+    manualRecoveryRequired: state.manualRecoveryRequired === true,
     environmentMutationCount: 0,
     deploymentMutationCount: 0,
     aliasMutationCount: 0,
@@ -257,6 +311,10 @@ function sanitizeState(state = {}) {
 
 function fail(code, stage, state = {}) {
   throw new VercelGitRelinkError(code, stage, state);
+}
+
+function isRetryablePostconditionError(error) {
+  return RETRYABLE_POSTCONDITION_ERROR_CODES.has(error?.code);
 }
 
 function responseFailureCode(status, resource) {
@@ -713,6 +771,20 @@ function safeProcessSignal(value) {
   return SAFE_SIGNAL.test(normalized) ? normalized : null;
 }
 
+function mutationTimeoutWithinDeadline({
+  deadlineAt,
+  now,
+  reserveMs,
+  maximumTimeoutMs,
+}) {
+  const remaining = deadlineAt - now();
+  const available = Math.floor(remaining - reserveMs);
+  if (!Number.isFinite(available) || available < MIN_MUTATION_TIMEOUT_MS) {
+    return null;
+  }
+  return Math.min(maximumTimeoutMs, available);
+}
+
 export function vercelGitRelinkChildEnvironment(
   configuration,
   sourceEnvironment = process.env,
@@ -736,13 +808,27 @@ export function vercelGitRelinkChildEnvironment(
   return Object.freeze(childEnvironment);
 }
 
-async function runVercelGitConnectCommand(configuration, destination) {
+async function runVercelGitConnectCommand(
+  configuration,
+  destination,
+  { timeoutMs } = {},
+) {
   const repositoryUrl = destination === "target"
     ? VERCEL_GIT_RELINK_TARGET_URL
     : destination === "source"
       ? VERCEL_GIT_RELINK_SOURCE_URL
       : null;
-  if (!repositoryUrl) {
+  const maximumTimeoutMs = destination === "target"
+    ? TARGET_CONNECT_TIMEOUT_MS
+    : destination === "source"
+      ? SOURCE_CONNECT_TIMEOUT_MS
+      : 0;
+  if (
+    !repositoryUrl
+    || !Number.isSafeInteger(timeoutMs)
+    || timeoutMs < MIN_MUTATION_TIMEOUT_MS
+    || timeoutMs > maximumTimeoutMs
+  ) {
     return Object.freeze({
       ok: false,
       errorCode: "VERCEL_GIT_RELINK_CONFIGURATION_INVALID",
@@ -777,7 +863,7 @@ async function runVercelGitConnectCommand(configuration, destination) {
       shell: false,
       stdio: "ignore",
       windowsHide: true,
-      timeout: OPERATION_TIMEOUT_MS,
+      timeout: timeoutMs,
     });
     if (result?.error?.code === "ETIMEDOUT") {
       operationCode = "VERCEL_GIT_RELINK_COMMAND_TIMEOUT";
@@ -813,12 +899,6 @@ async function runVercelGitConnectCommand(configuration, destination) {
   return Object.freeze({ ok: true, exitStatus: 0, signal: null });
 }
 
-function safeCommandFailureCode(result) {
-  return SAFE_ERROR_CODE_SET.has(result?.errorCode)
-    ? result.errorCode
-    : "VERCEL_GIT_RELINK_COMMAND_FAILED";
-}
-
 function recordObservedProject(state, project) {
   state.finalLinkState = project.state;
   state.productionBranchIsMain = project.productionBranchIsMain;
@@ -843,6 +923,7 @@ function projectMutationIdentityVerified(state) {
   return state.teamReadable === true
     && state.teamIdentityMatches === true
     && state.projectReadable === true
+    && state.formalProjectIdAnchorMatches === true
     && state.projectIdentityMatches === true
     && state.formalAliasReadable === true
     && state.formalAliasProjectMatches === true
@@ -858,18 +939,37 @@ async function readBoundedProjectPostcondition({
   expectedState,
 }) {
   let project;
+  let unsafeProjectObservation;
+  let lastError;
   for (let attempt = 1; attempt <= postconditionAttempts; attempt += 1) {
-    project = await readProject({
-      configuration,
-      fetcher,
-      deadlineAt,
-      stage: "project-after",
-    });
-    if (project.state === expectedState && project.productionBranchIsMain) break;
+    try {
+      project = await readProject({
+        configuration,
+        fetcher,
+        deadlineAt,
+        stage: "project-after",
+      });
+      lastError = undefined;
+      if (project.state === expectedState && project.productionBranchIsMain) break;
+      if (
+        project.state === "unexpected"
+        || project.state === "expected-source-id-unavailable"
+      ) unsafeProjectObservation = project;
+    } catch (error) {
+      if (!isRetryablePostconditionError(error)) throw error;
+      lastError = error;
+    }
     if (attempt < postconditionAttempts) {
-      await retryDelay(POSTCONDITION_RETRY_DELAY_MS, deadlineAt);
+      await retryDelay(
+        POSTCONDITION_RETRY_DELAY_MS,
+        deadlineAt,
+        "VERCEL_GIT_RELINK_TIMEOUT",
+      );
     }
   }
+  if (unsafeProjectObservation) return unsafeProjectObservation;
+  if (project?.state === "unlinked" && lastError) throw lastError;
+  if (!project && lastError) throw lastError;
   return project;
 }
 
@@ -881,20 +981,36 @@ async function connectSourceAndVerify({
   connectRepository,
   postconditionAttempts,
   retryDelay,
-  compensation,
+  now,
 }) {
   if (!projectMutationIdentityVerified(state)) {
     fail(
       "VERCEL_GIT_RELINK_UNKNOWN_SAFE_FAILURE",
-      compensation ? "compensate-source" : "restore-source",
+      "restore-source",
       state,
     );
   }
+  const timeoutMs = mutationTimeoutWithinDeadline({
+    deadlineAt,
+    now,
+    reserveMs: SOURCE_POST_MUTATION_VERIFICATION_RESERVE_MS,
+    maximumTimeoutMs: SOURCE_CONNECT_TIMEOUT_MS,
+  });
+  if (timeoutMs === null) {
+    return Object.freeze({
+      restored: false,
+      commandOk: false,
+      mutationAttempted: false,
+    });
+  }
   state.sourceRestoreMutationAttemptCount = 1;
-  if (compensation) state.compensationState = "unknown";
   let commandResult;
   try {
-    commandResult = await connectRepository(configuration, "source");
+    commandResult = await connectRepository(
+      configuration,
+      "source",
+      { timeoutMs },
+    );
   } catch {
     commandResult = { ok: false, errorCode: "VERCEL_GIT_RELINK_COMMAND_FAILED" };
   }
@@ -911,17 +1027,21 @@ async function connectSourceAndVerify({
     recordObservedProject(state, after);
   } catch {
     state.finalLinkState = "unchecked";
-    if (compensation) state.compensationState = "unknown";
-    return Object.freeze({ restored: false, commandOk: commandResult?.ok === true });
+    return Object.freeze({
+      restored: false,
+      commandOk: commandResult?.ok === true,
+      mutationAttempted: true,
+    });
   }
   const restored = after?.state === "expected-source" && after.productionBranchIsMain;
   if (restored) {
     state.sourceRestoreMutationVerifiedCount = 1;
-    if (compensation) state.compensationState = "restored-source";
-  } else if (compensation) {
-    state.compensationState = "failed";
   }
-  return Object.freeze({ restored, commandOk: commandResult?.ok === true });
+  return Object.freeze({
+    restored,
+    commandOk: commandResult?.ok === true,
+    mutationAttempted: true,
+  });
 }
 
 function successResult(state, outcome) {
@@ -949,6 +1069,7 @@ function enrichFailure(error, state) {
 export async function repointVercelGitRepository({
   mode = "dry-run",
   configuration,
+  expectedProjectIdSha256 = VERCEL_GIT_RELINK_FORMAL_PROJECT_ID_SHA256,
   fetcher = fetch,
   connectRepository = runVercelGitConnectCommand,
   postconditionAttempts = POSTCONDITION_ATTEMPTS,
@@ -956,7 +1077,11 @@ export async function repointVercelGitRepository({
   now = () => Date.now(),
 } = {}) {
   if (!SAFE_MODES.has(mode) || typeof fetcher !== "function") configurationError();
-  if (typeof connectRepository !== "function" || typeof retryDelay !== "function") {
+  if (
+    typeof connectRepository !== "function"
+    || typeof retryDelay !== "function"
+    || typeof now !== "function"
+  ) {
     configurationError();
   }
   if (
@@ -969,8 +1094,10 @@ export async function repointVercelGitRepository({
     || postconditionAttempts < 1
     || postconditionAttempts > POSTCONDITION_ATTEMPTS
   ) configurationError();
+  assertFormalProjectIdAnchor(configuration.projectId, expectedProjectIdSha256);
 
   const state = initialState(mode);
+  state.formalProjectIdAnchorMatches = true;
   const deadlineAt = now() + TOTAL_OPERATION_DEADLINE_MS;
   try {
     const targetRepository = await readTargetRepository({ fetcher, deadlineAt });
@@ -1042,8 +1169,16 @@ export async function repointVercelGitRepository({
         connectRepository,
         postconditionAttempts,
         retryDelay,
-        compensation: false,
+        now,
       });
+      if (!restoreResult.mutationAttempted) {
+        state.manualRecoveryRequired = true;
+        fail(
+          "VERCEL_GIT_RELINK_MANUAL_RECOVERY_REQUIRED",
+          "restore-source",
+          state,
+        );
+      }
       if (!restoreResult.restored) {
         fail(
           "VERCEL_GIT_RELINK_SOURCE_RESTORE_FAILED",
@@ -1078,102 +1213,93 @@ export async function repointVercelGitRepository({
       fail("VERCEL_GIT_RELINK_UNKNOWN_SAFE_FAILURE", "connect", state);
     }
 
+    const targetTimeoutMs = mutationTimeoutWithinDeadline({
+      deadlineAt,
+      now,
+      reserveMs: TARGET_POST_MUTATION_VERIFICATION_RESERVE_MS,
+      maximumTimeoutMs: TARGET_CONNECT_TIMEOUT_MS,
+    });
+    if (targetTimeoutMs === null) {
+      fail("VERCEL_GIT_RELINK_MUTATION_BUDGET_EXHAUSTED", "connect", state);
+    }
     state.gitLinkMutationAttemptCount = 1;
     let commandResult;
     try {
-      commandResult = await connectRepository(configuration, "target");
+      commandResult = await connectRepository(
+        configuration,
+        "target",
+        { timeoutMs: targetTimeoutMs },
+      );
     } catch {
       commandResult = { ok: false, errorCode: "VERCEL_GIT_RELINK_COMMAND_FAILED" };
     }
     if (commandResult?.ok !== true) {
-      const commandCode = safeCommandFailureCode(commandResult);
+      let afterFailure;
       try {
-        const afterFailure = await readProject({
+        afterFailure = await readBoundedProjectPostcondition({
           configuration,
           fetcher,
           deadlineAt,
-          stage: "project-after",
+          postconditionAttempts,
+          retryDelay,
+          expectedState: "expected-target",
         });
         recordPostTargetState(state, afterFailure);
-        if (afterFailure.state === "unlinked") {
-          const compensation = await connectSourceAndVerify({
-            state,
-            configuration,
-            fetcher,
-            deadlineAt,
-            connectRepository,
-            postconditionAttempts,
-            retryDelay,
-            compensation: true,
-          });
-          if (compensation.restored) {
-            fail(
-              "VERCEL_GIT_RELINK_TARGET_CONNECT_FAILED_COMPENSATED",
-              "compensate-source",
-              state,
-            );
-          }
-          fail(
-            "VERCEL_GIT_RELINK_COMPENSATION_FAILED",
-            "compensate-source",
-            state,
-          );
-        }
-      } catch {
-        if (state.sourceRestoreMutationAttemptCount === 1) {
-          fail(
-            state.sourceRestoreMutationVerifiedCount === 1
-              ? "VERCEL_GIT_RELINK_TARGET_CONNECT_FAILED_COMPENSATED"
-              : "VERCEL_GIT_RELINK_COMPENSATION_FAILED",
-            "compensate-source",
-            state,
-          );
-        }
+      } catch (error) {
+        if (!isRetryablePostconditionError(error)) throw error;
         state.postCommandFailureState = "unknown";
         state.postCommandFailureCheckCompleted = false;
         state.finalLinkState = "unchecked";
+        state.manualRecoveryRequired = true;
+        fail("VERCEL_GIT_RELINK_MANUAL_RECOVERY_REQUIRED", "project-after", state);
       }
-      fail(commandCode, "connect", state);
+      state.manualRecoveryRequired = true;
+      fail("VERCEL_GIT_RELINK_MANUAL_RECOVERY_REQUIRED", "project-after", state);
     }
 
-    const after = await readBoundedProjectPostcondition({
-      configuration,
-      fetcher,
-      deadlineAt,
-      postconditionAttempts,
-      retryDelay,
-      expectedState: "expected-target",
-    });
+    let after;
+    try {
+      after = await readBoundedProjectPostcondition({
+        configuration,
+        fetcher,
+        deadlineAt,
+        postconditionAttempts,
+        retryDelay,
+        expectedState: "expected-target",
+      });
+    } catch (error) {
+      if (!isRetryablePostconditionError(error)) throw error;
+      state.postCommandFailureState = "unknown";
+      state.postCommandFailureCheckCompleted = false;
+      state.finalLinkState = "unchecked";
+      state.manualRecoveryRequired = true;
+      fail("VERCEL_GIT_RELINK_MANUAL_RECOVERY_REQUIRED", "project-after", state);
+    }
     recordObservedProject(state, after);
     if (after?.state !== "expected-target" || !after.productionBranchIsMain) {
-      if (after?.state === "unlinked") {
-        const compensation = await connectSourceAndVerify({
-          state,
-          configuration,
-          fetcher,
-          deadlineAt,
-          connectRepository,
-          postconditionAttempts,
-          retryDelay,
-          compensation: true,
-        });
-        if (compensation.restored) {
-          fail(
-            "VERCEL_GIT_RELINK_TARGET_POSTCONDITION_FAILED_COMPENSATED",
-            "compensate-source",
-            state,
-          );
-        }
-        fail(
-          "VERCEL_GIT_RELINK_COMPENSATION_FAILED",
-          "compensate-source",
-          state,
-        );
-      }
-      fail("VERCEL_GIT_RELINK_POSTCONDITION_FAILED", "project-after", state);
+      state.manualRecoveryRequired = true;
+      fail("VERCEL_GIT_RELINK_MANUAL_RECOVERY_REQUIRED", "project-after", state);
     }
 
     state.gitLinkMutationVerifiedCount = 1;
+    const formalAliasAfter = await readFormalAliasDeployment({
+      configuration,
+      fetcher,
+      deadlineAt,
+    });
+    state.formalAliasReadable = formalAliasAfter.readable;
+    state.formalAliasProjectMatches = formalAliasAfter.projectMatches;
+    state.formalAliasProductionReady = formalAliasAfter.productionReady;
+    if (!formalAliasAfter.projectMatches) {
+      fail("VERCEL_GIT_RELINK_FORMAL_ALIAS_PROJECT_MISMATCH", "formal-alias", state);
+    }
+    if (!formalAliasAfter.productionReady) {
+      fail(
+        "VERCEL_GIT_RELINK_FORMAL_ALIAS_NOT_PRODUCTION_READY",
+        "formal-alias",
+        state,
+      );
+    }
     return successResult(state, "RELINKED");
   } catch (error) {
     enrichFailure(error, state);
