@@ -135,11 +135,11 @@ function validateAuditControlProof(proof, label) {
   assert.deepEqual(body.initialChangedPaths, INITIAL_CHANGED_PATHS, `${label} must bind the exact initial path set`);
   assert.deepEqual(body.compositeChangedPaths, COMPOSITE_CHANGED_PATHS, `${label} must bind the exact composite path set`);
   assert.equal(body.operation, "audit-rc6-2-last-known-good", `${label} operation drifted`);
-  assert.equal(body.repository, "bobobo-org/novel", `${label} repository drifted`);
+  assert.equal(body.repository, "brendonlee1006/novel", `${label} repository drifted`);
   assert.equal(body.eventName, "workflow_dispatch", `${label} event drifted`);
   assert.equal(body.eventRef, "refs/heads/main", `${label} ref drifted`);
   assert.equal(body.workflowSha, body.browserGateControl, `${label} workflow SHA drifted`);
-  assert.equal(body.workflowRef, "bobobo-org/novel/.github/workflows/deploy.yml@refs/heads/main", `${label} workflow ref drifted`);
+  assert.equal(body.workflowRef, "brendonlee1006/novel/.github/workflows/deploy.yml@refs/heads/main", `${label} workflow ref drifted`);
   assert.match(body.runId, /^[1-9][0-9]{0,19}$/u, `${label} run ID drifted`);
   assert.match(body.runAttempt, /^[1-9][0-9]{0,9}$/u, `${label} run attempt drifted`);
   assert.match(proofDigest, /^[a-f0-9]{64}$/u, `${label} digest must be a SHA-256 value`);
@@ -170,11 +170,11 @@ function auditControlProofFixture({
     c9BrowserGateControl: C9_BROWSER_GATE_CONTROL,
     browserGateControl: C10_AUDIT_CONTROL_FIXTURE,
     parentCommit: C9_BROWSER_GATE_CONTROL,
-    repository: "bobobo-org/novel",
+    repository: "brendonlee1006/novel",
     eventName: "workflow_dispatch",
     eventRef: "refs/heads/main",
     workflowSha: C10_AUDIT_CONTROL_FIXTURE,
-    workflowRef: "bobobo-org/novel/.github/workflows/deploy.yml@refs/heads/main",
+    workflowRef: "brendonlee1006/novel/.github/workflows/deploy.yml@refs/heads/main",
     runId: "1",
     runAttempt: "1",
     lineage: [C10_AUDIT_CONTROL_FIXTURE, C9_BROWSER_GATE_CONTROL, C8_BROWSER_GATE_CONTROL,
@@ -262,6 +262,7 @@ const jobNames = [
   "diagnose_trusted_preview_env",
   "preview",
   "historical_rc6_2_recovery_hold",
+  "bootstrap_lkg_repository_migration",
   "audit_last_known_good",
   "production_env_audit",
   "production_env_repair",
@@ -320,6 +321,7 @@ const trustedPreviewBootstrapCompleteJob = section("bootstrap_trusted_preview_en
 const trustedPreviewDiagnosisJob = section("diagnose_trusted_preview_env");
 const previewJob = section("preview");
 const historicalRecoveryHoldJob = section("historical_rc6_2_recovery_hold");
+const repositoryMigrationBootstrapJob = section("bootstrap_lkg_repository_migration");
 const lastKnownGoodAuditJob = section("audit_last_known_good");
 const productionAuditJob = section("production_env_audit");
 const repairJob = section("production_env_repair");
@@ -389,6 +391,8 @@ assert.match(globalConfiguration, /preview_ref:/u);
 assert.match(globalConfiguration, /bootstrap-trusted-preview-env/u);
 assert.match(globalConfiguration, /diagnose-trusted-preview-env/u);
 assert.match(globalConfiguration, /deploy-preview/u);
+assert.match(globalConfiguration, /bootstrap-lkg-repository-migration/u);
+assert.match(globalConfiguration, /consumer_run_id:[\s\S]*consumer_commit:/u);
 assert.match(globalConfiguration, /deploy-immutable-product-recovery/u);
 assert.match(globalConfiguration, /audit-rc6-2-last-known-good/u);
 assert.match(globalConfiguration, /RECOVERY_PRODUCT_COMMIT:\s*29fc6e742672bb07187765d34ea818afdadf56ae/u);
@@ -418,9 +422,38 @@ assert.match(globalConfiguration, /group:[^\r\n]*deploy-immutable-product-recove
 assert.match(globalConfiguration, /group:[^\r\n]*audit-rc6-2-last-known-good[^\r\n]*vercel-lkg-audit/u);
 assert.match(globalConfiguration, /group:[^\r\n]*bootstrap-trusted-preview-env[^\r\n]*deploy-preview[^\r\n]*vercel-trusted-attestation-preview/u);
 assert.match(globalConfiguration, /group:[^\r\n]*diagnose-trusted-preview-env[^\r\n]*vercel-trusted-attestation-preview/u);
+assert.match(globalConfiguration, /group:[^\r\n]*bootstrap-lkg-repository-migration[^\r\n]*production-lkg-repository-migration-bootstrap/u);
 assert.match(globalConfiguration, /cancel-in-progress:[^\r\n]*deploy-immutable-product-recovery/u);
 assert.match(globalConfiguration, /cancel-in-progress:[^\r\n]*bootstrap-trusted-preview-env[^\r\n]*deploy-preview/u);
 assert.match(globalConfiguration, /cancel-in-progress:[^\r\n]*diagnose-trusted-preview-env/u);
+assert.match(globalConfiguration, /cancel-in-progress:[^\r\n]*bootstrap-lkg-repository-migration/u);
+
+assert.match(repositoryMigrationBootstrapJob, /github\.event_name == 'workflow_dispatch'/u);
+assert.match(repositoryMigrationBootstrapJob, /github\.repository == 'brendonlee1006\/novel'/u);
+assert.match(repositoryMigrationBootstrapJob, /github\.repository_id == '1357493987'/u);
+assert.match(repositoryMigrationBootstrapJob, /inputs\.operation == 'bootstrap-lkg-repository-migration'/u);
+assert.match(repositoryMigrationBootstrapJob, /environment:\s*production-migration/u);
+assert.match(repositoryMigrationBootstrapJob, /permissions:\s*[\s\S]*contents:\s*read[\s\S]*actions:\s*read/u);
+assert.doesNotMatch(repositoryMigrationBootstrapJob, /actions:\s*write|contents:\s*write/u);
+assert.match(
+  repositoryMigrationBootstrapJob,
+  /SOURCE_LKG_READ_TOKEN:\s*\$\{\{ secrets\.SOURCE_LKG_READ_TOKEN \}\}/u,
+);
+assert.doesNotMatch(
+  workflow.replace(repositoryMigrationBootstrapJob, ""),
+  /\bSOURCE_LKG_READ_TOKEN\b/u,
+  "the scoped legacy-repository token must only be exposed to the migration bootstrap job",
+);
+assert.match(repositoryMigrationBootstrapJob, /production-last-known-good\.mjs bootstrap-source/u);
+assert.match(repositoryMigrationBootstrapJob, /Preflight target artifacts then verify source and write one-time seed/u);
+assert.match(repositoryMigrationBootstrapJob, /vercel-dual-alias-cutover\.mjs capture/u);
+assert.match(repositoryMigrationBootstrapJob, /PRIMARY_ALIAS_DEPLOYMENT_ID[\s\S]*MIRROR_ALIAS_DEPLOYMENT_ID/u);
+assert.match(repositoryMigrationBootstrapJob, /retention-days:\s*1/u);
+assert.doesNotMatch(
+  repositoryMigrationBootstrapJob,
+  /vercel\s+(?:deploy|alias|env)|supabase\s+(?:db|migration)|prisma\s+migrate/iu,
+  "the repository-migration bootstrap must not deploy, cut aliases, or mutate databases/environments",
+);
 
 assert.match(trustedPreviewBootstrapJob, /github\.event_name == 'workflow_dispatch'/u);
 assert.match(trustedPreviewBootstrapJob, /inputs\.operation == 'bootstrap-trusted-preview-env'/u);

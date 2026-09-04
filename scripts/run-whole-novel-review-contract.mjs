@@ -662,7 +662,7 @@ assert.match(panel, /score-arbitrator/u);
 assert.match(panel, /judgeReviews: modelReviews/u);
 assert.match(panel, /wholeNovelReviewScoreSpread\(modelReviews\) > 10/u);
 assert.match(panel, /blockingReasons/u);
-assert.match(panel, /reviewCurrent=\{reviewCurrent && review\.eligibleForPublicLounge\}/u);
+assert.match(panel, /reviewCurrent=\{reviewCurrent\}/u);
 assert.match(panel, /completionFingerprint/u);
 assert.match(panel, /maxLength=\{PUBLIC_LOUNGE_MAX_SYNOPSIS_CHARACTERS\}/u);
 assert.match(panel, /authorDisplayName/u);

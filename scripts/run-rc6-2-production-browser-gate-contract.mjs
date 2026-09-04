@@ -2480,9 +2480,9 @@ $script:StubGitLines = @("  ${expectedHead}  ")
 function Invoke-Git([string[]]$Arguments, [string]$Code) { return @($script:StubGitLines) }
 $actual = Invoke-GitScalar @("rev-parse", "HEAD") "GIT_SCALAR_SELF_TEST_FAILED"
 if ($actual -ne '${expectedHead}') { Fail "GIT_SCALAR_SELF_TEST_FAILED" }
-$script:StubGitLines = @("  https://github.com/bobobo-org/novel.git  ")
+$script:StubGitLines = @("  https://github.com/brendonlee1006/novel.git  ")
 $url = Invoke-GitScalar @("config", "--get", "remote.origin.url") "GIT_SCALAR_URL_SELF_TEST_FAILED"
-if ($url -ne "https://github.com/bobobo-org/novel.git") { Fail "GIT_SCALAR_URL_SELF_TEST_FAILED" }
+if ($url -ne "https://github.com/brendonlee1006/novel.git") { Fail "GIT_SCALAR_URL_SELF_TEST_FAILED" }
 $trimmed = Get-SingleTrimmedLine @("  ${expectedHead}  ") "GIT_SCALAR_TRIM_SELF_TEST_FAILED"
 if ($trimmed -ne '${expectedHead}') { Fail "GIT_SCALAR_TRIM_SELF_TEST_FAILED" }
 $script:StubGitLines = @()
@@ -2809,11 +2809,11 @@ async function writeAuditControlProof() {
   const runnerTemp = resolve(String(process.env.RUNNER_TEMP ?? ""));
   assert.match(controlCommit, /^[a-f0-9]{40}$/u);
   assert.equal(process.env.EXPECTED_OPERATION, "audit-rc6-2-last-known-good");
-  assert.equal(process.env.GITHUB_REPOSITORY, "bobobo-org/novel");
+  assert.equal(process.env.GITHUB_REPOSITORY, "brendonlee1006/novel");
   assert.equal(process.env.GITHUB_EVENT_NAME, "workflow_dispatch");
   assert.equal(process.env.GITHUB_REF, "refs/heads/main");
   assert.equal(process.env.GITHUB_WORKFLOW_SHA, controlCommit);
-  assert.match(String(process.env.GITHUB_WORKFLOW_REF ?? ""), /bobobo-org\/novel\/\.github\/workflows\/deploy\.yml@refs\/heads\/main$/u);
+  assert.match(String(process.env.GITHUB_WORKFLOW_REF ?? ""), /brendonlee1006\/novel\/\.github\/workflows\/deploy\.yml@refs\/heads\/main$/u);
   assert.match(String(process.env.GITHUB_RUN_ID ?? ""), /^[1-9][0-9]{0,19}$/u);
   assert.match(String(process.env.GITHUB_RUN_ATTEMPT ?? ""), /^[1-9][0-9]{0,9}$/u);
   assert.equal(dirname(outputPath), runnerTemp);
@@ -4590,10 +4590,10 @@ assert.match(wrapper, /C6_GATE_REPAIR_DIFF_INVALID/u);
 assert.match(wrapper, /GATE_COMPOSITE_DIFF_INVALID/u);
 assert.ok(occurrences(wrapper, "Assert-MainCas \"MAIN_CAS_") >= 4);
 assert.match(wrapper, /Assert-ReleaseTag/u);
-assert.match(wrapper, /\$githubApiRoot\/git\/ref\/heads\/main/u);
-assert.match(wrapper, /\$githubApiRoot\/git\/ref\/tags\/\$releaseTag/u);
-assert.match(wrapper, /\$githubApiRoot\/git\/tags\/\$releaseTagObject/u);
-assert.match(wrapper, /\$githubApiRoot\/releases\/tags\/\$releaseTag/u);
+assert.match(wrapper, /\$targetGithubApiRoot\/git\/ref\/heads\/main/u);
+assert.match(wrapper, /\$sourceGithubApiRoot\/git\/ref\/tags\/\$releaseTag/u);
+assert.match(wrapper, /\$sourceGithubApiRoot\/git\/tags\/\$releaseTagObject/u);
+assert.match(wrapper, /\$sourceGithubApiRoot\/releases\/tags\/\$releaseTag/u);
 assert.match(wrapper, /\$ref\.object\.sha -ne \$releaseTagObject/u);
 assert.match(wrapper, /\$tag\.object\.sha -ne \$productCommit/u);
 assert.match(wrapper, /\$release\.immutable -ne \$true/u);

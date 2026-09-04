@@ -656,7 +656,7 @@ try {
     createdAt: "2026-08-09T20:01:00.000Z",
   };
   const downloaded = await downloadLastKnownGoodArtifact({
-    repository: "bobobo-org/novel",
+    repository: "brendonlee1006/novel",
     token: "test-token-not-logged",
     artifact,
     fetcher: async () => ({
@@ -672,7 +672,7 @@ try {
   assert.equal(downloaded.proof.workflowRunControlPlaneVerified, true);
   const controlledZip = createStoredZip("last-known-good-production.json", JSON.stringify(newerLkg));
   const controlledDownloaded = await downloadLastKnownGoodArtifact({
-    repository: "bobobo-org/novel",
+    repository: "brendonlee1006/novel",
     token: "test-token-not-logged",
     artifact: {
       artifactId: 124,
@@ -716,7 +716,7 @@ try {
     JSON.stringify(controlledWithoutRecoveryProof),
   );
   await assert.rejects(() => downloadLastKnownGoodArtifact({
-    repository: "bobobo-org/novel",
+    repository: "brendonlee1006/novel",
     token: "test-token-not-logged",
     artifact: {
       artifactId: 125,
@@ -739,7 +739,7 @@ try {
     }),
   }), /LAST_KNOWN_GOOD_ARTIFACT_IDENTITY_MISMATCH/u);
   await assert.rejects(() => downloadLastKnownGoodArtifact({
-    repository: "bobobo-org/novel",
+    repository: "brendonlee1006/novel",
     token: "test-token-not-logged",
     artifact: {
       ...controlledDownloaded.proof,
@@ -754,7 +754,7 @@ try {
 }
 
 const discovered = await discoverLatestLastKnownGoodArtifact({
-  repository: "bobobo-org/novel",
+  repository: "brendonlee1006/novel",
   token: "test-token-not-logged",
   fetcher: async (url) => {
     if (String(url).includes("/actions/artifacts")) return {
@@ -829,7 +829,7 @@ const controlledDiscoveryFetcher = (event = "workflow_dispatch") => async (url) 
   };
 };
 const controlledDiscovered = await discoverLatestLastKnownGoodArtifact({
-  repository: "bobobo-org/novel",
+  repository: "brendonlee1006/novel",
   token: "test-token-not-logged",
   fetcher: controlledDiscoveryFetcher(),
 });
@@ -840,7 +840,7 @@ assert.equal(controlledDiscovered.workflowEvent, "workflow_dispatch");
 assert.equal(controlledDiscovered.workflowBranch, "main");
 assert.equal(controlledDiscovered.runAttempt, 2);
 assert.equal(await discoverLatestLastKnownGoodArtifact({
-  repository: "bobobo-org/novel",
+  repository: "brendonlee1006/novel",
   token: "test-token-not-logged",
   fetcher: controlledDiscoveryFetcher("push"),
 }), null);
@@ -873,12 +873,12 @@ const auditProvenance = {
   productCommit: CURRENT_COMMIT,
   controlCommit: CURRENT_COMMIT,
   controlProofDigest: "",
-  repository: "bobobo-org/novel",
+  repository: "brendonlee1006/novel",
   eventName: "workflow_dispatch",
   eventRef: "refs/heads/main",
   eventCommit: CURRENT_COMMIT,
   workflow: "Vercel Deploy",
-  workflowRef: "bobobo-org/novel/.github/workflows/deploy.yml@refs/heads/main",
+  workflowRef: "brendonlee1006/novel/.github/workflows/deploy.yml@refs/heads/main",
   workflowSha: CURRENT_COMMIT,
   runId: "31337634767",
   runAttempt: "2",

@@ -9,7 +9,7 @@ on:
   workflow_dispatch:
     inputs:
       operation:
-        description: Trusted Preview bootstrap/deploy/read-only diagnosis, read-only LKG audit, historical RC6.2 recovery HOLD, or Production rollback operation
+        description: Trusted Preview bootstrap/deploy/read-only diagnosis, one-time repository-migration LKG bootstrap, read-only LKG audit, historical RC6.2 recovery HOLD, or Production rollback operation
         required: true
         type: choice
         options:
@@ -18,10 +18,19 @@ on:
           - deploy-preview
           - audit-last-known-good
           - audit-rc6-2-last-known-good
+          - bootstrap-lkg-repository-migration
           - deploy-immutable-product-recovery
           - restore-known-stable
       preview_ref:
         description: Exact 40-character commit SHA from this repository (trusted Preview bootstrap/deploy or audit-last-known-good)
+        required: false
+        type: string
+      consumer_run_id:
+        description: Existing target-repository push/main workflow run ID authorized to consume the one-time migration seed (bootstrap-lkg-repository-migration only)
+        required: false
+        type: string
+      consumer_commit:
+        description: Exact 40-character target-repository commit for the authorized consumer run (bootstrap-lkg-repository-migration only)
         required: false
         type: string
 
@@ -31,8 +40,8 @@ permissions:
   attestations: read
 
 concurrency:
-  group: ${{ (((github.event_name == 'push' && github.ref == 'refs/heads/main') || (github.event_name == 'workflow_dispatch' && (inputs.operation == 'restore-known-stable' || inputs.operation == 'deploy-immutable-product-recovery'))) && 'vercel-production-main') || ((github.event_name == 'workflow_dispatch' && (inputs.operation == 'bootstrap-trusted-preview-env' || inputs.operation == 'diagnose-trusted-preview-env' || inputs.operation == 'deploy-preview')) && 'vercel-trusted-attestation-preview') || ((github.event_name == 'workflow_dispatch' && (inputs.operation == 'audit-last-known-good' || inputs.operation == 'audit-rc6-2-last-known-good')) && format('vercel-lkg-audit-{0}', inputs.preview_ref || github.sha)) || format('vercel-preview-{0}', github.event.pull_request.number || inputs.preview_ref || github.ref) }}
-  cancel-in-progress: ${{ !((github.event_name == 'push' && github.ref == 'refs/heads/main') || (github.event_name == 'workflow_dispatch' && (inputs.operation == 'bootstrap-trusted-preview-env' || inputs.operation == 'diagnose-trusted-preview-env' || inputs.operation == 'deploy-preview' || inputs.operation == 'restore-known-stable' || inputs.operation == 'audit-last-known-good' || inputs.operation == 'audit-rc6-2-last-known-good' || inputs.operation == 'deploy-immutable-product-recovery'))) }}
+  group: ${{ (((github.event_name == 'push' && github.ref == 'refs/heads/main') || (github.event_name == 'workflow_dispatch' && (inputs.operation == 'restore-known-stable' || inputs.operation == 'deploy-immutable-product-recovery'))) && 'vercel-production-main') || ((github.event_name == 'workflow_dispatch' && (inputs.operation == 'bootstrap-trusted-preview-env' || inputs.operation == 'diagnose-trusted-preview-env' || inputs.operation == 'deploy-preview')) && 'vercel-trusted-attestation-preview') || ((github.event_name == 'workflow_dispatch' && inputs.operation == 'bootstrap-lkg-repository-migration') && 'production-lkg-repository-migration-bootstrap') || ((github.event_name == 'workflow_dispatch' && (inputs.operation == 'audit-last-known-good' || inputs.operation == 'audit-rc6-2-last-known-good')) && format('vercel-lkg-audit-{0}', inputs.preview_ref || github.sha)) || format('vercel-preview-{0}', github.event.pull_request.number || inputs.preview_ref || github.ref) }}
+  cancel-in-progress: ${{ !((github.event_name == 'push' && github.ref == 'refs/heads/main') || (github.event_name == 'workflow_dispatch' && (inputs.operation == 'bootstrap-trusted-preview-env' || inputs.operation == 'diagnose-trusted-preview-env' || inputs.operation == 'deploy-preview' || inputs.operation == 'bootstrap-lkg-repository-migration' || inputs.operation == 'restore-known-stable' || inputs.operation == 'audit-last-known-good' || inputs.operation == 'audit-rc6-2-last-known-good' || inputs.operation == 'deploy-immutable-product-recovery'))) }}
 
 env:
   RECOVERY_PRODUCT_COMMIT: 29fc6e742672bb07187765d34ea818afdadf56ae
@@ -915,6 +924,131 @@ jobs:
           echo "HOLD: RC6.2 recovery is preserved only as read-only prior provenance; a current-main dispatch is not authorized." >&2
           exit 1
 
+  bootstrap_lkg_repository_migration:
+    name: bootstrap one-time repository-migration LKG seed
+    if: >-
+      github.event_name == 'workflow_dispatch' &&
+      github.ref == 'refs/heads/main' &&
+      github.repository == 'brendonlee1006/novel' &&
+      github.repository_id == '1357493987' &&
+      inputs.operation == 'bootstrap-lkg-repository-migration'
+    runs-on: ubuntu-latest
+    environment: production-migration
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - name: Checkout exact trusted migration-bootstrap control commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Require exact target and one existing authorized consumer run
+        shell: bash
+        env:
+          DISPATCH_OPERATION: ${{ inputs.operation }}
+          MIGRATION_CONSUMER_RUN_ID: ${{ inputs.consumer_run_id }}
+          MIGRATION_CONSUMER_COMMIT: ${{ inputs.consumer_commit }}
+          TARGET_REPOSITORY: ${{ github.repository }}
+          TARGET_REPOSITORY_ID: ${{ github.repository_id }}
+          TARGET_REF: ${{ github.ref }}
+          TARGET_CONTROL_COMMIT: ${{ github.sha }}
+          BOOTSTRAP_RUN_ID: ${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          test "$DISPATCH_OPERATION" = bootstrap-lkg-repository-migration
+          test "$TARGET_REPOSITORY" = brendonlee1006/novel
+          test "$TARGET_REPOSITORY_ID" = 1357493987
+          test "$TARGET_REF" = refs/heads/main
+          [[ "$TARGET_CONTROL_COMMIT" =~ ^[a-f0-9]{40}$ ]]
+          [[ "$MIGRATION_CONSUMER_RUN_ID" =~ ^[1-9][0-9]{0,19}$ ]]
+          [[ "$MIGRATION_CONSUMER_COMMIT" =~ ^[a-f0-9]{40}$ ]]
+          test "$MIGRATION_CONSUMER_RUN_ID" != "$BOOTSTRAP_RUN_ID"
+          test "$(git rev-parse HEAD)" = "$TARGET_CONTROL_COMMIT"
+
+      - name: Set up Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24
+
+      - name: Preflight target artifacts then verify source and write one-time seed
+        id: bootstrap_source
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          GITHUB_REPOSITORY_ID: ${{ github.repository_id }}
+          SOURCE_LKG_READ_TOKEN: ${{ secrets.SOURCE_LKG_READ_TOKEN }}
+          MIGRATION_OPERATION: ${{ inputs.operation }}
+          MIGRATION_CONSUMER_RUN_ID: ${{ inputs.consumer_run_id }}
+          MIGRATION_CONSUMER_COMMIT: ${{ inputs.consumer_commit }}
+          TARGET_REPOSITORY_ID: ${{ github.repository_id }}
+          SOURCE_LKG_IDENTITY_PATH: ${{ runner.temp }}/source-last-known-good-production.json
+          SOURCE_LKG_PROOF_PATH: ${{ runner.temp }}/source-last-known-good-artifact-proof.json
+          MIGRATION_SEED_PATH: ${{ runner.temp }}/last-known-good-production.json
+          MIGRATION_SELECTION_PROOF_PATH: ${{ runner.temp }}/repository-migration-selection-proof.json
+          VERCEL_ORG_ID: ${{ secrets.VERCEL_ORG_ID }}
+          VERCEL_PROJECT_ID: ${{ secrets.VERCEL_PROJECT_ID }}
+          VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
+          VERCEL_FETCH_TIMEOUT_MS: 10000
+          ROLLBACK_TARGET_SELECTION_DEADLINE_MS: 60000
+        run: node scripts/production-last-known-good.mjs bootstrap-source
+
+      - name: Capture inherited formal aliases without mutation
+        id: bootstrap_aliases
+        env:
+          VERCEL_ORG_ID: ${{ secrets.VERCEL_ORG_ID }}
+          VERCEL_PROJECT_ID: ${{ secrets.VERCEL_PROJECT_ID }}
+          VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
+          ALIAS_CAPTURE_DEADLINE_MS: 60000
+          VERCEL_FETCH_TIMEOUT_MS: 10000
+        run: node scripts/vercel-dual-alias-cutover.mjs capture
+
+      - name: Require fail-closed one-time seed publication truth
+        shell: bash
+        env:
+          MIGRATION_CONSUMER_RUN_ID: ${{ inputs.consumer_run_id }}
+          PUBLICATION_MODE: ${{ steps.bootstrap_source.outputs.publication_mode }}
+          SEED_ELIGIBLE: ${{ steps.bootstrap_source.outputs.seed_eligible }}
+          SEED_NAME: ${{ steps.bootstrap_source.outputs.seed_name }}
+          PRODUCT_COMMIT: ${{ steps.bootstrap_source.outputs.product_commit }}
+          SOURCE_DEPLOYMENT_ID: ${{ steps.bootstrap_source.outputs.source_deployment_id }}
+          OUTPUT_CONSUMER_RUN_ID: ${{ steps.bootstrap_source.outputs.consumer_run_id }}
+          SEED_PROVENANCE_DIGEST: ${{ steps.bootstrap_source.outputs.seed_provenance_digest }}
+          PRIMARY_ALIAS_DEPLOYMENT_ID: ${{ steps.bootstrap_aliases.outputs.primary_deployment_id }}
+          PRIMARY_ALIAS_COMMIT: ${{ steps.bootstrap_aliases.outputs.primary_app_commit }}
+          MIRROR_ALIAS_DEPLOYMENT_ID: ${{ steps.bootstrap_aliases.outputs.mirror_deployment_id }}
+          MIRROR_ALIAS_COMMIT: ${{ steps.bootstrap_aliases.outputs.mirror_app_commit }}
+        run: |
+          set -euo pipefail
+          test "$PUBLICATION_MODE" = repository-migration-seed
+          test "$SEED_ELIGIBLE" = true
+          test "$OUTPUT_CONSUMER_RUN_ID" = "$MIGRATION_CONSUMER_RUN_ID"
+          [[ "$PRODUCT_COMMIT" =~ ^[a-f0-9]{40}$ ]]
+          [[ "$SOURCE_DEPLOYMENT_ID" =~ ^dpl_[A-Za-z0-9]+$ ]]
+          [[ "$SEED_PROVENANCE_DIGEST" =~ ^[a-f0-9]{64}$ ]]
+          test "$PRIMARY_ALIAS_DEPLOYMENT_ID" = "$SOURCE_DEPLOYMENT_ID"
+          test "$PRIMARY_ALIAS_COMMIT" = "$PRODUCT_COMMIT"
+          test "$MIRROR_ALIAS_DEPLOYMENT_ID" = "$SOURCE_DEPLOYMENT_ID"
+          test "$MIRROR_ALIAS_COMMIT" = "$PRODUCT_COMMIT"
+          expected_seed_name="production-last-known-good-migration-control-${GITHUB_SHA}-consumer-${MIGRATION_CONSUMER_RUN_ID}-product-${PRODUCT_COMMIT}"
+          test "$SEED_NAME" = "$expected_seed_name"
+          test "$(basename "$RUNNER_TEMP/last-known-good-production.json")" = last-known-good-production.json
+          test -s "$RUNNER_TEMP/source-last-known-good-production.json"
+          test -s "$RUNNER_TEMP/source-last-known-good-artifact-proof.json"
+          test -s "$RUNNER_TEMP/last-known-good-production.json"
+          test -s "$RUNNER_TEMP/repository-migration-selection-proof.json"
+
+      - name: Upload one-time repository-migration LKG seed
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ${{ steps.bootstrap_source.outputs.seed_name }}
+          path: ${{ runner.temp }}/last-known-good-production.json
+          if-no-files-found: error
+          include-hidden-files: false
+          retention-days: 1
+
   audit_last_known_good:
     name: audit last known good read only
     needs: validate
@@ -980,6 +1114,8 @@ jobs:
         id: lkg
         env:
           GITHUB_TOKEN: ${{ github.token }}
+          GITHUB_REPOSITORY_ID: ${{ github.repository_id }}
+          ALLOW_REPOSITORY_MIGRATION_SEED: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && 'true' || 'false' }}
         run: node scripts/production-last-known-good.mjs discover
 
       - name: Require prior Last Known Good availability
@@ -1011,9 +1147,40 @@ jobs:
           [[ "${{ steps.lkg.outputs.control_commit }}" =~ ^[a-f0-9]{40}$ ]]
           test "${{ steps.lkg.outputs.workflow_branch }}" = main
 
+      - name: Require explicit normal-main LKG publication mode
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        shell: bash
+        env:
+          LKG_PUBLICATION_MODE: ${{ steps.lkg.outputs.publication_mode }}
+          LKG_SEED_ELIGIBLE: ${{ steps.lkg.outputs.seed_eligible }}
+          LKG_ARTIFACT_NAME: ${{ steps.lkg.outputs.artifact_name }}
+          LKG_PRODUCT_COMMIT: ${{ steps.lkg.outputs.product_commit }}
+          LKG_CONTROL_COMMIT: ${{ steps.lkg.outputs.control_commit }}
+        run: |
+          set -euo pipefail
+          case "$LKG_PUBLICATION_MODE:$LKG_SEED_ELIGIBLE" in
+            same-sha:false)
+              test "$LKG_ARTIFACT_NAME" = "production-last-known-good-${LKG_PRODUCT_COMMIT}"
+              ;;
+            immutable-product-control:false)
+              test "$LKG_ARTIFACT_NAME" = "production-last-known-good-control-${LKG_CONTROL_COMMIT}-product-${LKG_PRODUCT_COMMIT}"
+              ;;
+            repository-migration-seed:true)
+              test "$GITHUB_REPOSITORY" = brendonlee1006/novel
+              test "$GITHUB_REPOSITORY_ID" = 1357493987
+              test "$LKG_ARTIFACT_NAME" = "production-last-known-good-migration-control-${LKG_CONTROL_COMMIT}-consumer-${GITHUB_RUN_ID}-product-${LKG_PRODUCT_COMMIT}"
+              ;;
+            *)
+              echo "Refusing Last Known Good with an unsupported publication-mode/seed-eligibility pair." >&2
+              exit 1
+              ;;
+          esac
+
       - name: Download and verify prior Last Known Good identity
         env:
           GITHUB_TOKEN: ${{ github.token }}
+          GITHUB_REPOSITORY_ID: ${{ github.repository_id }}
+          ALLOW_REPOSITORY_MIGRATION_SEED: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && 'true' || 'false' }}
           LAST_KNOWN_GOOD_ARTIFACT_ID: ${{ steps.lkg.outputs.artifact_id }}
           LAST_KNOWN_GOOD_ARTIFACT_NAME: ${{ steps.lkg.outputs.artifact_name }}
           LAST_KNOWN_GOOD_ARTIFACT_DIGEST: ${{ steps.lkg.outputs.artifact_digest }}
@@ -1026,8 +1193,11 @@ jobs:
           LAST_KNOWN_GOOD_RUN_ATTEMPT: ${{ steps.lkg.outputs.run_attempt }}
           LAST_KNOWN_GOOD_WORKFLOW_PATH: ${{ steps.lkg.outputs.workflow_path }}
           LAST_KNOWN_GOOD_CREATED_AT: ${{ steps.lkg.outputs.created_at }}
+          LAST_KNOWN_GOOD_PUBLICATION_MODE: ${{ steps.lkg.outputs.publication_mode }}
           LAST_KNOWN_GOOD_PATH: ${{ runner.temp }}/last-known-good-production.json
           LAST_KNOWN_GOOD_PROOF_PATH: ${{ runner.temp }}/last-known-good-artifact-proof.json
+          VERCEL_ORG_ID: ${{ secrets.VERCEL_ORG_ID }}
+          VERCEL_PROJECT_ID: ${{ secrets.VERCEL_PROJECT_ID }}
           EXPECTED_LKG_APP_COMMIT: ${{ (inputs.operation == 'deploy-immutable-product-recovery' || inputs.operation == 'audit-rc6-2-last-known-good') && env.RC6_2_LKG_APP_COMMIT || '' }}
           EXPECTED_LKG_PRIMARY_DEPLOYMENT_ID: ${{ (inputs.operation == 'deploy-immutable-product-recovery' || inputs.operation == 'audit-rc6-2-last-known-good') && env.RC6_2_LKG_PRIMARY_DEPLOYMENT_ID || '' }}
           EXPECTED_LKG_MIRROR_DEPLOYMENT_ID: ${{ (inputs.operation == 'deploy-immutable-product-recovery' || inputs.operation == 'audit-rc6-2-last-known-good') && env.RC6_2_LKG_MIRROR_DEPLOYMENT_ID || '' }}
@@ -2433,6 +2603,8 @@ jobs:
         id: lkg
         env:
           GITHUB_TOKEN: ${{ github.token }}
+          GITHUB_REPOSITORY_ID: ${{ github.repository_id }}
+          ALLOW_REPOSITORY_MIGRATION_SEED: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && 'true' || 'false' }}
         run: node scripts/production-last-known-good.mjs discover
 
       - name: Require exact prior RC6.2 Last Known Good only for recovery cutover
@@ -2451,6 +2623,12 @@ jobs:
       - name: Require latest verified Last Known Good for normal cutover
         if: github.event_name == 'push' && github.ref == 'refs/heads/main'
         shell: bash
+        env:
+          LKG_PUBLICATION_MODE: ${{ steps.lkg.outputs.publication_mode }}
+          LKG_SEED_ELIGIBLE: ${{ steps.lkg.outputs.seed_eligible }}
+          LKG_ARTIFACT_NAME: ${{ steps.lkg.outputs.artifact_name }}
+          LKG_PRODUCT_COMMIT: ${{ steps.lkg.outputs.product_commit }}
+          LKG_CONTROL_COMMIT: ${{ steps.lkg.outputs.control_commit }}
         run: |
           set -euo pipefail
           test "${{ steps.lkg.outputs.available }}" = true
@@ -2460,11 +2638,30 @@ jobs:
           [[ "${{ steps.lkg.outputs.product_commit }}" =~ ^[a-f0-9]{40}$ ]]
           [[ "${{ steps.lkg.outputs.control_commit }}" =~ ^[a-f0-9]{40}$ ]]
           test "${{ steps.lkg.outputs.workflow_branch }}" = main
+          case "$LKG_PUBLICATION_MODE:$LKG_SEED_ELIGIBLE" in
+            same-sha:false)
+              test "$LKG_ARTIFACT_NAME" = "production-last-known-good-${LKG_PRODUCT_COMMIT}"
+              ;;
+            immutable-product-control:false)
+              test "$LKG_ARTIFACT_NAME" = "production-last-known-good-control-${LKG_CONTROL_COMMIT}-product-${LKG_PRODUCT_COMMIT}"
+              ;;
+            repository-migration-seed:true)
+              test "$GITHUB_REPOSITORY" = brendonlee1006/novel
+              test "$GITHUB_REPOSITORY_ID" = 1357493987
+              test "$LKG_ARTIFACT_NAME" = "production-last-known-good-migration-control-${LKG_CONTROL_COMMIT}-consumer-${GITHUB_RUN_ID}-product-${LKG_PRODUCT_COMMIT}"
+              ;;
+            *)
+              echo "Refusing Last Known Good with an unsupported publication-mode/seed-eligibility pair." >&2
+              exit 1
+              ;;
+          esac
 
       - name: Download latest Last Known Good identity
         if: steps.lkg.outputs.available == 'true'
         env:
           GITHUB_TOKEN: ${{ github.token }}
+          GITHUB_REPOSITORY_ID: ${{ github.repository_id }}
+          ALLOW_REPOSITORY_MIGRATION_SEED: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && 'true' || 'false' }}
           LAST_KNOWN_GOOD_ARTIFACT_ID: ${{ steps.lkg.outputs.artifact_id }}
           LAST_KNOWN_GOOD_ARTIFACT_NAME: ${{ steps.lkg.outputs.artifact_name }}
           LAST_KNOWN_GOOD_ARTIFACT_DIGEST: ${{ steps.lkg.outputs.artifact_digest }}
@@ -2477,8 +2674,11 @@ jobs:
           LAST_KNOWN_GOOD_RUN_ATTEMPT: ${{ steps.lkg.outputs.run_attempt }}
           LAST_KNOWN_GOOD_WORKFLOW_PATH: ${{ steps.lkg.outputs.workflow_path }}
           LAST_KNOWN_GOOD_CREATED_AT: ${{ steps.lkg.outputs.created_at }}
+          LAST_KNOWN_GOOD_PUBLICATION_MODE: ${{ steps.lkg.outputs.publication_mode }}
           LAST_KNOWN_GOOD_PATH: ${{ runner.temp }}/last-known-good-production.json
           LAST_KNOWN_GOOD_PROOF_PATH: ${{ runner.temp }}/last-known-good-artifact-proof.json
+          VERCEL_ORG_ID: ${{ secrets.VERCEL_ORG_ID }}
+          VERCEL_PROJECT_ID: ${{ secrets.VERCEL_PROJECT_ID }}
           EXPECTED_LKG_APP_COMMIT: ${{ github.event_name == 'workflow_dispatch' && inputs.operation == 'deploy-immutable-product-recovery' && env.RC6_2_LKG_APP_COMMIT || '' }}
           EXPECTED_LKG_PRIMARY_DEPLOYMENT_ID: ${{ github.event_name == 'workflow_dispatch' && inputs.operation == 'deploy-immutable-product-recovery' && env.RC6_2_LKG_PRIMARY_DEPLOYMENT_ID || '' }}
           EXPECTED_LKG_MIRROR_DEPLOYMENT_ID: ${{ github.event_name == 'workflow_dispatch' && inputs.operation == 'deploy-immutable-product-recovery' && env.RC6_2_LKG_MIRROR_DEPLOYMENT_ID || '' }}
@@ -3000,15 +3200,46 @@ jobs:
         id: guard_lkg
         env:
           GITHUB_TOKEN: ${{ github.token }}
+          GITHUB_REPOSITORY_ID: ${{ github.repository_id }}
+          ALLOW_REPOSITORY_MIGRATION_SEED: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && 'true' || 'false' }}
         run: node scripts/production-last-known-good.mjs discover
 
       - name: Require a verified Last Known Good rollback target
         shell: bash
-        run: test "${{ steps.guard_lkg.outputs.available }}" = true
+        env:
+          LKG_PUBLICATION_MODE: ${{ steps.guard_lkg.outputs.publication_mode }}
+          LKG_SEED_ELIGIBLE: ${{ steps.guard_lkg.outputs.seed_eligible }}
+          LKG_ARTIFACT_NAME: ${{ steps.guard_lkg.outputs.artifact_name }}
+          LKG_PRODUCT_COMMIT: ${{ steps.guard_lkg.outputs.product_commit }}
+          LKG_CONTROL_COMMIT: ${{ steps.guard_lkg.outputs.control_commit }}
+        run: |
+          set -euo pipefail
+          test "${{ steps.guard_lkg.outputs.available }}" = true
+          case "$LKG_PUBLICATION_MODE:$LKG_SEED_ELIGIBLE" in
+            same-sha:false)
+              test "$LKG_ARTIFACT_NAME" = "production-last-known-good-${LKG_PRODUCT_COMMIT}"
+              ;;
+            immutable-product-control:false)
+              test "$LKG_ARTIFACT_NAME" = "production-last-known-good-control-${LKG_CONTROL_COMMIT}-product-${LKG_PRODUCT_COMMIT}"
+              ;;
+            repository-migration-seed:true)
+              test "$GITHUB_EVENT_NAME" = push
+              test "$GITHUB_REF" = refs/heads/main
+              test "$GITHUB_REPOSITORY" = brendonlee1006/novel
+              test "$GITHUB_REPOSITORY_ID" = 1357493987
+              test "$LKG_ARTIFACT_NAME" = "production-last-known-good-migration-control-${LKG_CONTROL_COMMIT}-consumer-${GITHUB_RUN_ID}-product-${LKG_PRODUCT_COMMIT}"
+              ;;
+            *)
+              echo "Refusing Last Known Good with an unsupported publication-mode/seed-eligibility pair." >&2
+              exit 1
+              ;;
+          esac
 
       - name: Download verified Last Known Good for rollback guard
         env:
           GITHUB_TOKEN: ${{ github.token }}
+          GITHUB_REPOSITORY_ID: ${{ github.repository_id }}
+          ALLOW_REPOSITORY_MIGRATION_SEED: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && 'true' || 'false' }}
           LAST_KNOWN_GOOD_ARTIFACT_ID: ${{ steps.guard_lkg.outputs.artifact_id }}
           LAST_KNOWN_GOOD_ARTIFACT_NAME: ${{ steps.guard_lkg.outputs.artifact_name }}
           LAST_KNOWN_GOOD_ARTIFACT_DIGEST: ${{ steps.guard_lkg.outputs.artifact_digest }}
@@ -3021,8 +3252,11 @@ jobs:
           LAST_KNOWN_GOOD_RUN_ATTEMPT: ${{ steps.guard_lkg.outputs.run_attempt }}
           LAST_KNOWN_GOOD_WORKFLOW_PATH: ${{ steps.guard_lkg.outputs.workflow_path }}
           LAST_KNOWN_GOOD_CREATED_AT: ${{ steps.guard_lkg.outputs.created_at }}
+          LAST_KNOWN_GOOD_PUBLICATION_MODE: ${{ steps.guard_lkg.outputs.publication_mode }}
           LAST_KNOWN_GOOD_PATH: ${{ runner.temp }}/guard-last-known-good-production.json
           LAST_KNOWN_GOOD_PROOF_PATH: ${{ runner.temp }}/guard-last-known-good-artifact-proof.json
+          VERCEL_ORG_ID: ${{ secrets.VERCEL_ORG_ID }}
+          VERCEL_PROJECT_ID: ${{ secrets.VERCEL_PROJECT_ID }}
         run: node scripts/production-last-known-good.mjs download
 
       - name: Select independently verified rollback target

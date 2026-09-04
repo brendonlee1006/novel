@@ -103,8 +103,9 @@ $edgeExe = $null
 $edgeVersionRoot = $null
 $edgeDll = $null
 $edgeToolchainManifestPath = $null
-$canonicalRepositoryUrl = "https://github.com/bobobo-org/novel.git"
-$githubApiRoot = "https://api.github.com/repos/bobobo-org/novel"
+$canonicalRepositoryUrl = "https://github.com/brendonlee1006/novel.git"
+$targetGithubApiRoot = "https://api.github.com/repos/brendonlee1006/novel"
+$sourceGithubApiRoot = "https://api.github.com/repos/bobobo-org/novel"
 $expectedGitSha256 = "22fead8244ef3a7225fb800099a4e43eca8bcec0466774917669599c2f19a05a"
 $expectedGhSha256 = "cd79f16203f1fbe56937c4c96e2b6eadd10549418dcb241d91576ac77af0ac8b"
 $expectedNodeSha256 = "9a4eb5f1c29c6a2e93852ead46b999e284a6a5ca8bab4d4e241d587d025a52de"
@@ -1562,7 +1563,7 @@ function Invoke-ReleaseAttestationVerification([string]$Code) {
 }
 
 function Assert-MainCas([string]$Code) {
-  $ref = Invoke-GitHubJson "$githubApiRoot/git/ref/heads/main" $Code
+  $ref = Invoke-GitHubJson "$targetGithubApiRoot/git/ref/heads/main" $Code
   if (
     [string]$ref.ref -ne "refs/heads/main" -or
     [string]$ref.object.type -ne "commit" -or
@@ -1573,7 +1574,9 @@ function Assert-MainCas([string]$Code) {
 }
 
 function Invoke-GitHubJson([string]$Uri, [string]$Code) {
-  if (-not $Uri.StartsWith("$githubApiRoot/", [StringComparison]::Ordinal)) { Fail $Code }
+  $isTargetApi = $Uri.StartsWith("$targetGithubApiRoot/", [StringComparison]::Ordinal)
+  $isSourceApi = $Uri.StartsWith("$sourceGithubApiRoot/", [StringComparison]::Ordinal)
+  if (-not $isTargetApi -and -not $isSourceApi) { Fail $Code }
   try {
     return Invoke-RestMethod -Uri "$Uri`?gate=$([Guid]::NewGuid().ToString('N'))" -TimeoutSec 30 -Headers @{
       Accept = "application/vnd.github+json"
@@ -1664,9 +1667,9 @@ function Assert-ProductRuntimeBlobs {
 }
 
 function Assert-ReleaseTag {
-  $ref = Invoke-GitHubJson "$githubApiRoot/git/ref/tags/$releaseTag" "REMOTE_TAG_READ_FAILED"
-  $tag = Invoke-GitHubJson "$githubApiRoot/git/tags/$releaseTagObject" "REMOTE_TAG_OBJECT_READ_FAILED"
-  $release = Invoke-GitHubJson "$githubApiRoot/releases/tags/$releaseTag" "REMOTE_RELEASE_READ_FAILED"
+  $ref = Invoke-GitHubJson "$sourceGithubApiRoot/git/ref/tags/$releaseTag" "REMOTE_TAG_READ_FAILED"
+  $tag = Invoke-GitHubJson "$sourceGithubApiRoot/git/tags/$releaseTagObject" "REMOTE_TAG_OBJECT_READ_FAILED"
+  $release = Invoke-GitHubJson "$sourceGithubApiRoot/releases/tags/$releaseTag" "REMOTE_RELEASE_READ_FAILED"
   if (
     [string]$ref.ref -ne "refs/tags/$releaseTag" -or
     [string]$ref.object.type -ne "tag" -or
@@ -1688,7 +1691,7 @@ function Assert-ReleaseTag {
 }
 
 function Assert-LkgAudit {
-  $run = Invoke-GitHubJson "$githubApiRoot/actions/runs/$ExpectedLkgAuditRunId" "LKG_AUDIT_RUN_READ_FAILED"
+  $run = Invoke-GitHubJson "$sourceGithubApiRoot/actions/runs/$ExpectedLkgAuditRunId" "LKG_AUDIT_RUN_READ_FAILED"
   if (
     [long]$run.id -ne $ExpectedLkgAuditRunId -or
     [string]$run.name -ne "Vercel Deploy" -or
@@ -1701,7 +1704,7 @@ function Assert-LkgAudit {
     [string]$run.conclusion -ne "success"
   ) { Fail "LKG_AUDIT_RUN_IDENTITY_INVALID" }
 
-  $jobs = Invoke-GitHubJson "$githubApiRoot/actions/runs/$ExpectedLkgAuditRunId/jobs" "LKG_AUDIT_JOBS_READ_FAILED"
+  $jobs = Invoke-GitHubJson "$sourceGithubApiRoot/actions/runs/$ExpectedLkgAuditRunId/jobs" "LKG_AUDIT_JOBS_READ_FAILED"
   $expectedSkippedJobs = @(
     "alias cutover",
     "build",
@@ -1730,7 +1733,7 @@ function Assert-LkgAudit {
     if ($actualSkippedJobs[$index] -ne $expectedSkippedJobs[$index]) { Fail "LKG_AUDIT_JOB_TOPOLOGY_INVALID" }
   }
 
-  $artifacts = Invoke-GitHubJson "$githubApiRoot/actions/runs/$ExpectedLkgAuditRunId/artifacts" "LKG_AUDIT_ARTIFACT_READ_FAILED"
+  $artifacts = Invoke-GitHubJson "$sourceGithubApiRoot/actions/runs/$ExpectedLkgAuditRunId/artifacts" "LKG_AUDIT_ARTIFACT_READ_FAILED"
   $expectedName = "production-lkg-readonly-audit-rc62-$productCommit-$expectedDeployment-$ExpectedLkgAuditControlProofDigest-$ExpectedLkgSelectionProofDigest-$ExpectedLkgAuditRunId"
   if ([int]$artifacts.total_count -ne 1 -or @($artifacts.artifacts).Count -ne 1) {
     Fail "LKG_AUDIT_ARTIFACT_TOPOLOGY_INVALID"
@@ -1744,7 +1747,7 @@ function Assert-LkgAudit {
     [string]$auditArtifact.digest -notmatch '^sha256:[a-f0-9]{64}$'
   ) { Fail "LKG_AUDIT_ARTIFACT_IDENTITY_INVALID" }
 
-  $lkgArtifact = Invoke-GitHubJson "$githubApiRoot/actions/artifacts/$lkgArtifactId" "LKG_ARTIFACT_READ_FAILED"
+  $lkgArtifact = Invoke-GitHubJson "$sourceGithubApiRoot/actions/artifacts/$lkgArtifactId" "LKG_ARTIFACT_READ_FAILED"
   $expectedLkgArtifactName = "production-last-known-good-control-$productionRecoveryControl-product-$productCommit"
   if (
     [long]$lkgArtifact.id -ne $lkgArtifactId -or

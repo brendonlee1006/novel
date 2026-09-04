@@ -95,5 +95,11 @@ assert.equal(publicationSource.includes("maxLength={PUBLIC_LOUNGE_MAX_SYNOPSIS_C
 assert.equal(publicationSource.includes("loadPublicLoungeWorkPublicationReference"), true);
 assert.equal(publicationSource.includes("savePublicLoungeWorkPublicationReference"), true);
 assert.equal(publicationSource.includes("disabled={working || !serverAttestation}"), false);
+assert.equal(publicationSource.includes("const eligible = reviewCurrent && review.eligibleForPublicLounge;"), true);
+assert.equal(publicationSource.includes("if (!readyToPublish || transactionInFlight.current) return;"), true);
+assert.equal(publicationSource.includes("chapters.length === review.publicMetadata.chapterCount"), true);
+assert.equal(publicationSource.includes("selectedChapters.length === review.publicMetadata.chapterCount"), true);
+assert.equal(publicationSource.includes("issuePublicLoungeAttestationV5"), true);
+assert.equal(publicationSource.includes("requestPublicLoungeEligibilityProofV5"), true);
 
 console.log("PUBLIC_LOUNGE_UI_CONTRACT_TESTS_PASS");

@@ -1765,7 +1765,7 @@ async function testLastKnownGoodAndRollback() {
   assert.match(lkgSource, /current-transaction-capture[\s\S]*last-known-good[\s\S]*emergency-static/u);
 
   const artifact = await discoverLatestLastKnownGoodArtifact({
-    repository: "bobobo-org/novel",
+    repository: "brendonlee1006/novel",
     token: "test-token",
     fetcher: async (rawUrl) => {
       const url = String(rawUrl);
@@ -1791,7 +1791,7 @@ async function testLastKnownGoodAndRollback() {
   });
   assert.equal(artifact.runId, 9);
   const rejectedFailedRun = await discoverLatestLastKnownGoodArtifact({
-    repository: "bobobo-org/novel",
+    repository: "brendonlee1006/novel",
     token: "test-token",
     fetcher: async (rawUrl) => String(rawUrl).includes("/actions/artifacts")
       ? new Response(JSON.stringify({ artifacts: [{
@@ -1808,7 +1808,7 @@ async function testLastKnownGoodAndRollback() {
 
   const artifactPages = [];
   const paginatedArtifact = await discoverLatestLastKnownGoodArtifact({
-    repository: "bobobo-org/novel",
+    repository: "brendonlee1006/novel",
     token: "test-token",
     fetcher: async (rawUrl) => {
       const url = new URL(String(rawUrl));
@@ -1858,7 +1858,7 @@ async function testLastKnownGoodAndRollback() {
   assert.equal(corrupt.candidate, null);
   assert.ok(corrupt.rejectionCode);
   const discoveryFailure = await safeDiscoverLatestLastKnownGoodArtifact({
-    repository: "bobobo-org/novel",
+    repository: "brendonlee1006/novel",
     token: "test-token",
     fetchTimeoutMs: 20,
     deadlineAt: Date.now() + 100,

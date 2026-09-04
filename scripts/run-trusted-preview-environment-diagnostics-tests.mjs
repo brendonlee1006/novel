@@ -197,7 +197,7 @@ await test("GET-only diagnosis and poison stripping", async () => {
     VERCEL_PROJECT_ID: "prj_fixture",
     VERCEL_ORG_ID: "team_fixture",
     VERCEL_TOKEN: fakeToken,
-    GITHUB_REPOSITORY: "bobobo-org/novel",
+    GITHUB_REPOSITORY: "brendonlee1006/novel",
     GITHUB_REF: `refs/heads/${TRUSTED_PREVIEW_BRANCH}`,
   }, {
     get(target, property) {
@@ -220,7 +220,7 @@ await test("GET-only diagnosis and poison stripping", async () => {
         accountId: "team_fixture",
         link: {
           type: "github",
-          org: "bobobo-org",
+          org: "brendonlee1006",
           repo: "novel",
           productionBranch: "main",
         },
@@ -280,7 +280,7 @@ await test("unobserved Vercel branch is not reported as directly valid", async (
       VERCEL_PROJECT_ID: "prj_fixture",
       VERCEL_ORG_ID: "team_fixture",
       VERCEL_TOKEN: fakeToken,
-      GITHUB_REPOSITORY: "bobobo-org/novel",
+      GITHUB_REPOSITORY: "brendonlee1006/novel",
       GITHUB_REF: `refs/heads/${TRUSTED_PREVIEW_BRANCH}`,
     },
   }, {
@@ -314,7 +314,7 @@ await test("project name identifiers and default main branch are normalized safe
       accountId: "team_fixture",
       link: {
         type: "github",
-        org: "bobobo-org",
+        org: "brendonlee1006",
         repo: "novel",
         productionBranch: "",
       },
@@ -331,7 +331,7 @@ await test("project linkage drift is boolean-only", async () => {
       VERCEL_PROJECT_ID: "prj_fixture",
       VERCEL_ORG_ID: "team_fixture",
       VERCEL_TOKEN: fakeToken,
-      GITHUB_REPOSITORY: "bobobo-org/novel",
+      GITHUB_REPOSITORY: "brendonlee1006/novel",
       GITHUB_REF: `refs/heads/${TRUSTED_PREVIEW_BRANCH}`,
     },
   }, {
